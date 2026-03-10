@@ -1,38 +1,40 @@
-# MSQuic Load Test
+# proto-test-msquic
 
-Standalone MSQuic echo load tester with:
-
-- multiple server listeners in one process
-- multiple client connections in one process
-- sustained request flooding with configurable in-flight depth
-- latency and throughput reporting
-- a transport abstraction for protocol comparison work
-
-The server accepts bidirectional streams and echoes fixed-size framed messages.
-The client opens one bidirectional stream per connection, floods messages, and
-reports aggregate RTT and throughput.
-
-Protocols currently available:
+Protocol load-test tool for comparing:
 
 - `msquic`
-- `sctp` on Linux
+- Linux `sctp`
+- `sctp + dtls` when the runtime has OpenSSL SCTP BIO support
 
-SCTP transport options:
+The project provides:
 
-- `--sctp-tls=1` enables DTLS-over-SCTP
-- `--ca=FILE` sets the CA bundle for peer verification
+- multi-listener server in one process
+- multi-connection client in one process
+- fixed-size flood traffic with configurable in-flight depth
+- optional fixed-rate pacing with `--send-pps`
+- aggregate throughput and RTT latency reporting
+- Docker packaging for a DTLS-over-SCTP-capable test environment
 
-The current machine's OpenSSL build disables SCTP BIO support (`OPENSSL_NO_SCTP`),
-so `--sctp-tls=1` will fail fast here until OpenSSL is rebuilt with SCTP enabled.
+The server echoes framed messages. The client timestamps each message, floods or
+paces traffic, and reports message counts, bytes, and RTT summary statistics.
 
-## Docker Image For DTLS-over-SCTP
+## Current Status
 
-The repo includes a multi-stage Docker image in [docker/Dockerfile](/home/administrator/msquic-test/docker/Dockerfile) that:
+Implemented today:
 
-- builds OpenSSL with `enable-sctp`
-- builds MSQuic against that OpenSSL
-- builds this load test binary against the in-container MSQuic and OpenSSL
-- generates a self-signed certificate for immediate testing
+- `msquic` transport
+- Linux `sctp` transport
+- DTLS-over-SCTP support in the Docker image build
+- benchmark helper scripts for scaling and PPS sweeps
+- GitHub Actions for image builds and tag-based releases
+
+Useful defaults:
+
+- default base port: `15443`
+- default message size in examples: `1024`
+- latency is measured from the timestamp embedded in echoed payloads
+
+## Quick Start With The Docker Image
 
 Build the image:
 
@@ -40,91 +42,44 @@ Build the image:
 ./scripts/docker-build-image.sh
 ```
 
-Optional build variables:
-
-- `IMAGE_NAME=msquic-loadtest:sctp-dtls`
-- `OPENSSL_VERSION=3.5.0`
-- `MSQUIC_REF=main`
-
-## GitHub Automation
-
-GitHub Actions is configured to:
-
-- build the Docker image on pushes to `main` and on pull requests
-- publish a versioned binary bundle and Docker image on tags matching `v*`
-- push container images to `ghcr.io/acore2026/proto-test-msquic`
-
-Release workflow outputs:
-
-- GitHub release asset: `msquic-loadtest-<tag>-linux-x86_64.tar.gz`
-- container image tags:
-  - `ghcr.io/acore2026/proto-test-msquic:<tag>`
-  - `ghcr.io/acore2026/proto-test-msquic:latest`
-
-Create a release by pushing a tag:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-Run a quick DTLS-over-SCTP demo:
+Run a quick DTLS-over-SCTP smoke test:
 
 ```bash
 ./scripts/docker-run-sctp-dtls-demo.sh
 ```
 
-Run a scaling sweep across server/client counts:
+Run the image manually:
 
 ```bash
-./scripts/docker-scaling-test.sh
+docker run --rm msquic-loadtest:sctp-dtls help
 ```
 
-Run a fixed-PPS sweep:
+If you already exported the image to disk:
 
 ```bash
-./scripts/docker-pps-sweep-test.sh
+docker load -i ~/msquic-loadtest-sctp-dtls.tar
 ```
 
-The demo uses `--network host` so SCTP sockets work without additional Docker
-port mapping. If you run containers manually, prefer host networking for local
-benchmarking.
+## Local Build
 
-The sweep scripts print CSV to stdout and accept environment overrides such as:
-
-- `PROTOCOLS="msquic sctp"`
-- `SERVER_COUNTS="1 2 4"`
-- `CLIENT_COUNTS="1 2 4 8"`
-- `PPS_VALUES="1000 2000 5000 8000 10000 12000"`
-- `CLIENTS=8`
-- `SERVER_COUNT=1`
-
-## Build
-
-```bash
-cmake -S . -B build
-cmake --build build -j
-```
-
-If your local MSQuic checkout is not `/home/administrator/msquic`, point CMake
-at it:
+This path depends on a local MSQuic checkout.
 
 ```bash
 cmake -S . -B build -DMSQUIC_ROOT=/path/to/msquic
+cmake --build build -j
 ```
 
-## Generate a Self-Signed Certificate
+If you do not have local MSQuic set up, use the Docker image instead.
+
+Generate self-signed certs for local testing:
 
 ```bash
 ./scripts/gen-cert.sh certs
 ```
 
-This creates:
+## Basic Run Examples
 
-- `certs/server.crt`
-- `certs/server.key`
-
-## Run a Server
+MSQuic server:
 
 ```bash
 ./build/msquic-loadtest server \
@@ -132,81 +87,238 @@ This creates:
   --cert=certs/server.crt \
   --key=certs/server.key \
   --base-port=15443 \
-  --server-count=4
+  --server-count=1
 ```
 
-## Run a Client
+MSQuic client:
 
 ```bash
 ./build/msquic-loadtest client \
   --protocol=msquic \
   --target=127.0.0.1 \
   --base-port=15443 \
-  --server-count=4 \
-  --clients=128 \
+  --server-count=1 \
+  --clients=8 \
   --message-size=1024 \
   --max-inflight=64 \
-  --duration-sec=30
+  --duration-sec=10
 ```
 
-## Useful Options
-
-- `--protocol=msquic|sctp`
-- `--alpn=msquic-load`
-- `--stats-interval-ms=1000`
-- `--idle-timeout-ms=30000`
-- `--bind=0.0.0.0`
-- `--drain-timeout-ms=5000`
-- `--verify-peer=1` to enable certificate validation on the client
-- `--sctp-nodelay=1`
-- `--sctp-stream-id=0`
-- `--sctp-tls=1`
-- `--ca=/path/to/ca.pem`
-
-## SCTP Example
+Plain SCTP server:
 
 ```bash
 ./build/msquic-loadtest server \
   --protocol=sctp \
   --base-port=16443 \
-  --server-count=4
+  --server-count=1
+```
 
+Plain SCTP client:
+
+```bash
 ./build/msquic-loadtest client \
   --protocol=sctp \
   --target=127.0.0.1 \
   --base-port=16443 \
-  --server-count=4 \
-  --clients=128 \
+  --server-count=1 \
+  --clients=8 \
   --message-size=1024 \
   --max-inflight=64 \
-  --duration-sec=30
+  --duration-sec=10
 ```
 
-## SCTP DTLS Example
+DTLS-over-SCTP with the Docker image:
 
 ```bash
-msquic-loadtest server \
+docker run --rm -d \
+  --name sctp-server \
+  --network host \
+  --sysctl net.sctp.auth_enable=1 \
+  msquic-loadtest:sctp-dtls \
+  server \
   --protocol=sctp \
   --sctp-tls=1 \
   --cert=/opt/msquic-loadtest/certs/server.crt \
   --key=/opt/msquic-loadtest/certs/server.key \
   --base-port=15443
 
-msquic-loadtest client \
+docker run --rm \
+  --network host \
+  --sysctl net.sctp.auth_enable=1 \
+  msquic-loadtest:sctp-dtls \
+  client \
   --protocol=sctp \
   --sctp-tls=1 \
   --target=127.0.0.1 \
   --base-port=15443 \
   --clients=8 \
-  --duration-sec=30
+  --duration-sec=10
 ```
+
+## Example Benchmark Commands
+
+Flood test with QUIC:
+
+```bash
+./build/msquic-loadtest client \
+  --protocol=msquic \
+  --target=127.0.0.1 \
+  --base-port=15443 \
+  --server-count=1 \
+  --clients=8 \
+  --message-size=1024 \
+  --max-inflight=64 \
+  --duration-sec=5 \
+  --drain-timeout-ms=2000
+```
+
+Fixed-rate test with QUIC:
+
+```bash
+./build/msquic-loadtest client \
+  --protocol=msquic \
+  --target=127.0.0.1 \
+  --base-port=15443 \
+  --server-count=1 \
+  --clients=8 \
+  --message-size=1024 \
+  --max-inflight=64 \
+  --duration-sec=5 \
+  --drain-timeout-ms=2000 \
+  --send-pps=10000
+```
+
+Fixed-rate test with DTLS-over-SCTP in Docker:
+
+```bash
+docker run --rm \
+  --network bridge \
+  --sysctl net.sctp.auth_enable=1 \
+  msquic-loadtest:sctp-dtls \
+  client \
+  --protocol=sctp \
+  --sctp-tls=1 \
+  --target=server-container-name \
+  --base-port=15443 \
+  --server-count=1 \
+  --clients=8 \
+  --message-size=1024 \
+  --max-inflight=64 \
+  --duration-sec=5 \
+  --drain-timeout-ms=2000 \
+  --send-pps=10000
+```
+
+## Benchmark Helper Scripts
+
+Quick demo:
+
+```bash
+./scripts/docker-run-sctp-dtls-demo.sh
+```
+
+Scaling sweep across server and client counts:
+
+```bash
+./scripts/docker-scaling-test.sh
+```
+
+Example with explicit matrix:
+
+```bash
+PROTOCOLS="msquic sctp" \
+SERVER_COUNTS="1 2 4" \
+CLIENT_COUNTS="1 2 4 8" \
+./scripts/docker-scaling-test.sh
+```
+
+Fixed-PPS sweep:
+
+```bash
+./scripts/docker-pps-sweep-test.sh
+```
+
+Example with explicit rates:
+
+```bash
+PROTOCOLS="msquic sctp" \
+PPS_VALUES="1000 2000 5000 8000 10000 12000" \
+CLIENTS=8 \
+SERVER_COUNT=1 \
+./scripts/docker-pps-sweep-test.sh
+```
+
+The sweep scripts print CSV to stdout.
+
+## Common Options
+
+- `--protocol=msquic|sctp`
+- `--server-count=N`
+- `--clients=N`
+- `--message-size=N`
+- `--max-inflight=N`
+- `--duration-sec=N`
+- `--drain-timeout-ms=N`
+- `--stats-interval-ms=N`
+- `--send-pps=N`
+- `--verify-peer=1`
+- `--sctp-tls=1`
+- `--sctp-nodelay=1`
+- `--sctp-stream-id=N`
+- `--ca=/path/to/ca.pem`
+
+## Docker Image Notes
+
+The image in [docker/Dockerfile](/home/administrator/msquic-test/docker/Dockerfile):
+
+- builds OpenSSL with `enable-sctp`
+- builds MSQuic against that OpenSSL
+- builds this project inside the same environment
+- generates a self-signed certificate for immediate testing
+
+Default image build variables:
+
+- `IMAGE_NAME=msquic-loadtest:sctp-dtls`
+- `OPENSSL_VERSION=3.5.0`
+- `MSQUIC_REF=main`
+
+For SCTP + DTLS in containers, `net.sctp.auth_enable=1` must be available.
+
+## GitHub Automation
+
+GitHub Actions is configured to:
+
+- build the Docker image on pushes to `main`
+- build the Docker image on pull requests
+- publish a binary tarball on tags matching `v*`
+- publish container images to `ghcr.io/acore2026/proto-test-msquic`
+
+Release outputs:
+
+- GitHub release asset: `msquic-loadtest-<tag>-linux-x86_64.tar.gz`
+- image tags:
+  - `ghcr.io/acore2026/proto-test-msquic:<tag>`
+  - `ghcr.io/acore2026/proto-test-msquic:latest`
+
+Create a release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+## Repository Layout
+
+- [src/main.cpp](/home/administrator/msquic-test/src/main.cpp): application and transport implementations
+- [docker/Dockerfile](/home/administrator/msquic-test/docker/Dockerfile): reproducible DTLS-over-SCTP build image
+- [scripts/docker-build-image.sh](/home/administrator/msquic-test/scripts/docker-build-image.sh): image build helper
+- [scripts/docker-run-sctp-dtls-demo.sh](/home/administrator/msquic-test/scripts/docker-run-sctp-dtls-demo.sh): quick end-to-end demo
+- [scripts/docker-scaling-test.sh](/home/administrator/msquic-test/scripts/docker-scaling-test.sh): scaling sweep
+- [scripts/docker-pps-sweep-test.sh](/home/administrator/msquic-test/scripts/docker-pps-sweep-test.sh): fixed-rate sweep
+- [scripts/package-release-from-image.sh](/home/administrator/msquic-test/scripts/package-release-from-image.sh): release tarball packager
 
 ## Notes
 
-- Client validation is disabled by default because load tests commonly use a
-  self-signed cert.
-- The default base port is `15443`. Using `4443` can collide with other local
-  QUIC services on development machines.
-- The client distributes connections across listeners as
-  `base-port + (connection_index % server-count)`.
-- Latency is measured from the send timestamp embedded in each echoed message.
+- Client certificate verification is disabled by default for load-test convenience.
+- The client distributes connections across listeners as `base-port + (connection_index % server-count)`.
+- `4443` is intentionally not the default port because it commonly collides with other local QUIC services.
