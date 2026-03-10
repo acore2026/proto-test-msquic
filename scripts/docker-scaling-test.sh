@@ -9,6 +9,7 @@ MAX_INFLIGHT="${MAX_INFLIGHT:-64}"
 DURATION_SEC="${DURATION_SEC:-5}"
 DRAIN_TIMEOUT_MS="${DRAIN_TIMEOUT_MS:-2000}"
 STATS_INTERVAL_MS="${STATS_INTERVAL_MS:-1000}"
+SEND_PPS="${SEND_PPS:-10000}"
 SERVER_COUNTS="${SERVER_COUNTS:-1 2 4}"
 CLIENT_COUNTS="${CLIENT_COUNTS:-1 2 4 8}"
 PROTOCOLS="${PROTOCOLS:-msquic sctp}"
@@ -89,7 +90,7 @@ summary_to_csv() {
   return 1
 }
 
-echo "protocol,servers,clients,sent_messages,echoed_messages,sent_bytes,echoed_bytes,latency_avg_ms,latency_min_ms,latency_max_ms,latency_p50_ms,latency_p75_ms,latency_p99_ms"
+echo "protocol,servers,clients,send_pps,sent_messages,echoed_messages,sent_bytes,echoed_bytes,latency_avg_ms,latency_min_ms,latency_max_ms,latency_p50_ms,latency_p75_ms,latency_p99_ms"
 
 for protocol in ${PROTOCOLS}; do
   for servers in ${SERVER_COUNTS}; do
@@ -136,24 +137,25 @@ for protocol in ${PROTOCOLS}; do
         --duration-sec="${DURATION_SEC}" \
         --drain-timeout-ms="${DRAIN_TIMEOUT_MS}" \
         --stats-interval-ms="${STATS_INTERVAL_MS}" \
+        --send-pps="${SEND_PPS}" \
         >"${client_log}" 2>&1; then
         "${DOCKER_BIN}" logs scale-server >"${server_log}" 2>&1 || true
-        echo "${protocol},${servers},${clients},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR $(tr '\n' ' ' < "${client_log}")"
+        echo "${protocol},${servers},${clients},${SEND_PPS},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR $(tr '\n' ' ' < "${client_log}")"
         continue
       fi
 
       "${DOCKER_BIN}" logs scale-server >"${server_log}" 2>&1 || true
       summary="$(grep '^client summary:' "${client_log}" | tail -1 || true)"
       if [[ -z "${summary}" ]]; then
-        echo "${protocol},${servers},${clients},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR"
+        echo "${protocol},${servers},${clients},${SEND_PPS},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR"
         continue
       fi
       summary="${summary#client summary: }"
       if ! csv_fields="$(summary_to_csv "${summary}")"; then
-        echo "${protocol},${servers},${clients},PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR"
+        echo "${protocol},${servers},${clients},${SEND_PPS},PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR"
         continue
       fi
-      echo "${protocol},${servers},${clients},${csv_fields}"
+      echo "${protocol},${servers},${clients},${SEND_PPS},${csv_fields}"
     done
   done
 done

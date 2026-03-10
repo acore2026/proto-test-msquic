@@ -224,12 +224,17 @@ Scaling sweep across server and client counts:
 ./scripts/docker-scaling-test.sh
 ```
 
+By default this uses a fixed total offered load of `SEND_PPS=10000` across all
+client connections so protocol comparisons stay fair. Set `SEND_PPS=0` if you
+explicitly want flood mode instead.
+
 Example with explicit matrix:
 
 ```bash
 PROTOCOLS="msquic sctp" \
 SERVER_COUNTS="1 2 4" \
 CLIENT_COUNTS="1 2 4 8" \
+SEND_PPS=10000 \
 ./scripts/docker-scaling-test.sh
 ```
 
