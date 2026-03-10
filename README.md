@@ -46,6 +46,28 @@ Optional build variables:
 - `OPENSSL_VERSION=3.5.0`
 - `MSQUIC_REF=main`
 
+## GitHub Automation
+
+GitHub Actions is configured to:
+
+- build the Docker image on pushes to `main` and on pull requests
+- publish a versioned binary bundle and Docker image on tags matching `v*`
+- push container images to `ghcr.io/acore2026/proto-test-msquic`
+
+Release workflow outputs:
+
+- GitHub release asset: `msquic-loadtest-<tag>-linux-x86_64.tar.gz`
+- container image tags:
+  - `ghcr.io/acore2026/proto-test-msquic:<tag>`
+  - `ghcr.io/acore2026/proto-test-msquic:latest`
+
+Create a release by pushing a tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 Run a quick DTLS-over-SCTP demo:
 
 ```bash
