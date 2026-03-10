@@ -33,7 +33,7 @@ Useful defaults:
 - default base port: `15443`
 - default message size in examples: `1024`
 - latency is measured from the timestamp embedded in echoed payloads
-- latency summaries include `avg`, `min`, `max`, `p50`, `p75`, and `p99`
+- latency summaries include `p50`, `p75`, and `p99`
 
 ## Quick Start With The Docker Image
 
@@ -255,8 +255,7 @@ SERVER_COUNT=1 \
 ```
 
 The sweep scripts print CSV to stdout.
-Their output includes `latency_avg_ms`, `latency_min_ms`, `latency_max_ms`,
-`latency_p50_ms`, `latency_p75_ms`, and `latency_p99_ms`.
+Their output includes `latency_p50_ms`, `latency_p75_ms`, and `latency_p99_ms`.
 
 ## Common Options
 

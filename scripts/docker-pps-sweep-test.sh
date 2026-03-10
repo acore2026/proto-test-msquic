@@ -73,24 +73,21 @@ protocol_client_args() {
 
 summary_to_csv() {
   local summary="$1"
-  if [[ "${summary}" =~ sent_messages=([0-9]+)\ echoed_messages=([0-9]+)\ sent_bytes=([0-9]+)\ echoed_bytes=([0-9]+)\ latency_ms\(avg/min/max/p50/p75/p99\)=([^/]+)/([^/]+)/([^/]+)/([^/]+)/([^/]+)/([^[:space:]]+) ]]; then
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  if [[ "${summary}" =~ sent_messages=([0-9]+)\ echoed_messages=([0-9]+)\ sent_bytes=([0-9]+)\ echoed_bytes=([0-9]+)\ latency_ms\(p50/p75/p99\)=([^/]+)/([^/]+)/([^[:space:]]+) ]]; then
+    printf '%s,%s,%s,%s,%s,%s,%s\n' \
       "${BASH_REMATCH[1]}" \
       "${BASH_REMATCH[2]}" \
       "${BASH_REMATCH[3]}" \
       "${BASH_REMATCH[4]}" \
       "${BASH_REMATCH[5]}" \
       "${BASH_REMATCH[6]}" \
-      "${BASH_REMATCH[7]}" \
-      "${BASH_REMATCH[8]}" \
-      "${BASH_REMATCH[9]}" \
-      "${BASH_REMATCH[10]}"
+      "${BASH_REMATCH[7]}"
     return 0
   fi
   return 1
 }
 
-echo "protocol,send_pps,sent_messages,echoed_messages,sent_bytes,echoed_bytes,latency_avg_ms,latency_min_ms,latency_max_ms,latency_p50_ms,latency_p75_ms,latency_p99_ms"
+echo "protocol,send_pps,sent_messages,echoed_messages,sent_bytes,echoed_bytes,latency_p50_ms,latency_p75_ms,latency_p99_ms"
 
 for protocol in ${PROTOCOLS}; do
   for pps in ${PPS_VALUES}; do
@@ -139,19 +136,19 @@ for protocol in ${PROTOCOLS}; do
       --stats-interval-ms="${STATS_INTERVAL_MS}" \
       >"${client_log}" 2>&1; then
       "${DOCKER_BIN}" logs pps-server >"${server_log}" 2>&1 || true
-      echo "${protocol},${pps},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR $(tr '\n' ' ' < "${client_log}")"
+      echo "${protocol},${pps},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR $(tr '\n' ' ' < "${client_log}")"
       continue
     fi
 
     "${DOCKER_BIN}" logs pps-server >"${server_log}" 2>&1 || true
     summary="$(grep '^client summary:' "${client_log}" | tail -1 || true)"
     if [[ -z "${summary}" ]]; then
-      echo "${protocol},${pps},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR"
+      echo "${protocol},${pps},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR"
       continue
     fi
     summary="${summary#client summary: }"
     if ! csv_fields="$(summary_to_csv "${summary}")"; then
-      echo "${protocol},${pps},PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR"
+      echo "${protocol},${pps},PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR"
       continue
     fi
     echo "${protocol},${pps},${csv_fields}"
