@@ -377,6 +377,16 @@ struct SendBuffer {
 
 class Stats {
   public:
+    struct LatencySnapshot {
+        uint64_t count{0};
+        uint64_t sum_ns{0};
+        uint64_t min_ns{std::numeric_limits<uint64_t>::max()};
+        uint64_t max_ns{0};
+        uint64_t p50_ns{std::numeric_limits<uint64_t>::max()};
+        uint64_t p75_ns{std::numeric_limits<uint64_t>::max()};
+        uint64_t p99_ns{std::numeric_limits<uint64_t>::max()};
+    };
+
     void AddSent(uint64_t bytes) {
         sent_bytes_.fetch_add(bytes, std::memory_order_relaxed);
         sent_messages_.fetch_add(1, std::memory_order_relaxed);
@@ -392,6 +402,8 @@ class Stats {
         latency_sum_ns_.fetch_add(latency_ns, std::memory_order_relaxed);
         UpdateMin(latency_min_ns_, latency_ns);
         UpdateMax(latency_max_ns_, latency_ns);
+        std::lock_guard<std::mutex> lock(latency_samples_mutex_);
+        latency_samples_.push_back(latency_ns);
     }
 
     struct Snapshot {
@@ -399,10 +411,7 @@ class Stats {
         uint64_t recv_bytes;
         uint64_t sent_messages;
         uint64_t recv_messages;
-        uint64_t latency_count;
-        uint64_t latency_sum_ns;
-        uint64_t latency_min_ns;
-        uint64_t latency_max_ns;
+        LatencySnapshot latency;
     };
 
     Snapshot SnapshotNow() const {
@@ -411,14 +420,45 @@ class Stats {
             recv_bytes_.load(std::memory_order_relaxed),
             sent_messages_.load(std::memory_order_relaxed),
             recv_messages_.load(std::memory_order_relaxed),
-            latency_count_.load(std::memory_order_relaxed),
-            latency_sum_ns_.load(std::memory_order_relaxed),
-            latency_min_ns_.load(std::memory_order_relaxed),
-            latency_max_ns_.load(std::memory_order_relaxed),
+            BuildLatencySnapshot(),
         };
     }
 
   private:
+    LatencySnapshot BuildLatencySnapshot() const {
+        LatencySnapshot snapshot;
+        snapshot.count = latency_count_.load(std::memory_order_relaxed);
+        snapshot.sum_ns = latency_sum_ns_.load(std::memory_order_relaxed);
+        snapshot.min_ns = latency_min_ns_.load(std::memory_order_relaxed);
+        snapshot.max_ns = latency_max_ns_.load(std::memory_order_relaxed);
+
+        std::vector<uint64_t> samples;
+        {
+            std::lock_guard<std::mutex> lock(latency_samples_mutex_);
+            samples = latency_samples_;
+        }
+
+        if (samples.empty()) {
+            snapshot.min_ns = std::numeric_limits<uint64_t>::max();
+            return snapshot;
+        }
+
+        std::sort(samples.begin(), samples.end());
+        snapshot.p50_ns = PercentileValue(samples, 0.50);
+        snapshot.p75_ns = PercentileValue(samples, 0.75);
+        snapshot.p99_ns = PercentileValue(samples, 0.99);
+        return snapshot;
+    }
+
+    static uint64_t PercentileValue(const std::vector<uint64_t>& sorted, double percentile) {
+        if (sorted.empty()) {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        const double scaled = percentile * static_cast<double>(sorted.size() - 1);
+        const size_t index = static_cast<size_t>(scaled + 0.5);
+        return sorted[std::min(index, sorted.size() - 1)];
+    }
+
     static void UpdateMin(std::atomic<uint64_t>& target, uint64_t value) {
         uint64_t current = target.load(std::memory_order_relaxed);
         while (value < current &&
@@ -441,6 +481,8 @@ class Stats {
     std::atomic<uint64_t> latency_sum_ns_{0};
     std::atomic<uint64_t> latency_min_ns_{std::numeric_limits<uint64_t>::max()};
     std::atomic<uint64_t> latency_max_ns_{0};
+    mutable std::mutex latency_samples_mutex_;
+    std::vector<uint64_t> latency_samples_;
 };
 
 std::string FormatRateMbps(uint64_t bytes, double seconds) {
@@ -460,6 +502,18 @@ std::string FormatLatencyMs(uint64_t ns) {
     std::ostringstream stream;
     stream << std::fixed << std::setprecision(3)
            << (static_cast<double>(ns) / 1'000'000.0);
+    return stream.str();
+}
+
+std::string FormatLatencySummary(const Stats::LatencySnapshot& latency) {
+    const auto avg_latency_ns = latency.count == 0 ? 0 : latency.sum_ns / latency.count;
+    std::ostringstream stream;
+    stream << FormatLatencyMs(avg_latency_ns) << "/"
+           << FormatLatencyMs(latency.min_ns) << "/"
+           << FormatLatencyMs(latency.max_ns) << "/"
+           << FormatLatencyMs(latency.p50_ns) << "/"
+           << FormatLatencyMs(latency.p75_ns) << "/"
+           << FormatLatencyMs(latency.p99_ns);
     return stream.str();
 }
 
@@ -494,17 +548,12 @@ class StatsPrinter {
             const auto delta_sent_bytes = current.sent_bytes - previous.sent_bytes;
             const auto delta_recv_bytes = current.recv_bytes - previous.recv_bytes;
             const auto delta_recv_messages = current.recv_messages - previous.recv_messages;
-            const auto avg_latency_ns =
-                current.latency_count == 0 ? 0 : current.latency_sum_ns / current.latency_count;
-
             std::cout << "[" << name_ << "] "
                       << "tx=" << FormatRateMbps(delta_sent_bytes, seconds) << " Mbps "
                       << "rx=" << FormatRateMbps(delta_recv_bytes, seconds) << " Mbps "
                       << "msg/s=" << static_cast<uint64_t>(delta_recv_messages / std::max(seconds, 0.001)) << " "
-                      << "latency_ms(avg/min/max)="
-                      << FormatLatencyMs(avg_latency_ns) << "/"
-                      << FormatLatencyMs(current.latency_min_ns) << "/"
-                      << FormatLatencyMs(current.latency_max_ns)
+                      << "latency_ms(avg/min/max/p50/p75/p99)="
+                      << FormatLatencySummary(current.latency)
                       << std::endl;
 
             previous = current;
@@ -1485,7 +1534,7 @@ class SctpServer {
         std::cout << "server summary: "
                   << "tx_messages=" << snapshot.sent_messages
                   << " rx_messages=" << snapshot.recv_messages
-                  << " latency_ms(avg/min/max)=0.000/n/a/0.000"
+                  << " latency_ms(avg/min/max/p50/p75/p99)=0.000/n/a/0.000/n/a/n/a/n/a"
                   << std::endl;
     }
 
@@ -1535,17 +1584,13 @@ class SctpClient {
   private:
     void PrintSummary() {
         const auto snapshot = stats_.SnapshotNow();
-        const auto avg_latency_ns =
-            snapshot.latency_count == 0 ? 0 : snapshot.latency_sum_ns / snapshot.latency_count;
         std::cout << "client summary: "
                   << "sent_messages=" << snapshot.sent_messages
                   << " echoed_messages=" << snapshot.recv_messages
                   << " sent_bytes=" << snapshot.sent_bytes
                   << " echoed_bytes=" << snapshot.recv_bytes
-                  << " latency_ms(avg/min/max)="
-                  << FormatLatencyMs(avg_latency_ns) << "/"
-                  << FormatLatencyMs(snapshot.latency_min_ns) << "/"
-                  << FormatLatencyMs(snapshot.latency_max_ns)
+                  << " latency_ms(avg/min/max/p50/p75/p99)="
+                  << FormatLatencySummary(snapshot.latency)
                   << std::endl;
     }
 
@@ -1924,15 +1969,11 @@ class Server {
 
     void PrintSummary() {
         const auto snapshot = stats_.SnapshotNow();
-        const auto avg_latency_ns =
-            snapshot.latency_count == 0 ? 0 : snapshot.latency_sum_ns / snapshot.latency_count;
         std::cout << "server summary: "
                   << "tx_messages=" << snapshot.sent_messages
                   << " rx_messages=" << snapshot.recv_messages
-                  << " latency_ms(avg/min/max)="
-                  << FormatLatencyMs(avg_latency_ns) << "/"
-                  << FormatLatencyMs(snapshot.latency_min_ns) << "/"
-                  << FormatLatencyMs(snapshot.latency_max_ns)
+                  << " latency_ms(avg/min/max/p50/p75/p99)="
+                  << FormatLatencySummary(snapshot.latency)
                   << std::endl;
     }
 
@@ -2314,17 +2355,13 @@ class Client {
 
     void PrintSummary() {
         const auto snapshot = stats_.SnapshotNow();
-        const auto avg_latency_ns =
-            snapshot.latency_count == 0 ? 0 : snapshot.latency_sum_ns / snapshot.latency_count;
         std::cout << "client summary: "
                   << "sent_messages=" << snapshot.sent_messages
                   << " echoed_messages=" << snapshot.recv_messages
                   << " sent_bytes=" << snapshot.sent_bytes
                   << " echoed_bytes=" << snapshot.recv_bytes
-                  << " latency_ms(avg/min/max)="
-                  << FormatLatencyMs(avg_latency_ns) << "/"
-                  << FormatLatencyMs(snapshot.latency_min_ns) << "/"
-                  << FormatLatencyMs(snapshot.latency_max_ns)
+                  << " latency_ms(avg/min/max/p50/p75/p99)="
+                  << FormatLatencySummary(snapshot.latency)
                   << std::endl;
     }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE_NAME="${IMAGE_NAME:-msquic-loadtest:sctp-dtls}"
+IMAGE_NAME="${IMAGE_NAME:-ghcr.io/acore2026/proto-test-msquic:latest}"
 SERVER_CONTAINER="${SERVER_CONTAINER:-msquic-loadtest-server}"
 CLIENT_CONTAINER="${CLIENT_CONTAINER:-msquic-loadtest-client}"
 PORT="${PORT:-15443}"

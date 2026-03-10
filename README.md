@@ -33,6 +33,7 @@ Useful defaults:
 - default base port: `15443`
 - default message size in examples: `1024`
 - latency is measured from the timestamp embedded in echoed payloads
+- latency summaries include `avg`, `min`, `max`, `p50`, `p75`, and `p99`
 
 ## Quick Start With The Docker Image
 
@@ -51,7 +52,7 @@ Run a quick DTLS-over-SCTP smoke test:
 Run the image manually:
 
 ```bash
-docker run --rm msquic-loadtest:sctp-dtls help
+docker run --rm ghcr.io/acore2026/proto-test-msquic:latest help
 ```
 
 If you already exported the image to disk:
@@ -134,7 +135,7 @@ docker run --rm -d \
   --name sctp-server \
   --network host \
   --sysctl net.sctp.auth_enable=1 \
-  msquic-loadtest:sctp-dtls \
+  ghcr.io/acore2026/proto-test-msquic:latest \
   server \
   --protocol=sctp \
   --sctp-tls=1 \
@@ -145,7 +146,7 @@ docker run --rm -d \
 docker run --rm \
   --network host \
   --sysctl net.sctp.auth_enable=1 \
-  msquic-loadtest:sctp-dtls \
+  ghcr.io/acore2026/proto-test-msquic:latest \
   client \
   --protocol=sctp \
   --sctp-tls=1 \
@@ -194,7 +195,7 @@ Fixed-rate test with DTLS-over-SCTP in Docker:
 docker run --rm \
   --network bridge \
   --sysctl net.sctp.auth_enable=1 \
-  msquic-loadtest:sctp-dtls \
+  ghcr.io/acore2026/proto-test-msquic:latest \
   client \
   --protocol=sctp \
   --sctp-tls=1 \
@@ -249,6 +250,8 @@ SERVER_COUNT=1 \
 ```
 
 The sweep scripts print CSV to stdout.
+Their output includes `latency_avg_ms`, `latency_min_ms`, `latency_max_ms`,
+`latency_p50_ms`, `latency_p75_ms`, and `latency_p99_ms`.
 
 ## Common Options
 
@@ -278,7 +281,7 @@ The image in [docker/Dockerfile](/home/administrator/msquic-test/docker/Dockerfi
 
 Default image build variables:
 
-- `IMAGE_NAME=msquic-loadtest:sctp-dtls`
+- `IMAGE_NAME=ghcr.io/acore2026/proto-test-msquic:latest`
 - `OPENSSL_VERSION=3.5.0`
 - `MSQUIC_REF=main`
 
