@@ -261,6 +261,7 @@ void PrintUsage() {
         << "  --target=HOST              Server name or IP\n"
         << "  --clients=N                Number of connections, default 1\n"
         << "  --max-inflight=N           Max outstanding echoed messages per connection, default 64\n"
+        << "  --send-server-index=N      Only send on connections mapped to this server index, default all\n"
         << "  --send-pps=N               Total offered message rate across all clients, default unlimited\n"
         << "  --duration-sec=N           Active send duration, default 30\n"
         << "  --drain-timeout-ms=N       Drain time after send stop, default 5000\n"
@@ -290,6 +291,7 @@ struct AppConfig {
     std::string target{"127.0.0.1"};
     uint32_t client_count{1};
     uint32_t max_inflight{64};
+    int send_server_index{-1};
     uint64_t send_pps{0};
     uint64_t duration_sec{30};
     uint64_t drain_timeout_ms{5000};
@@ -337,6 +339,7 @@ AppConfig LoadConfig(const Args& args) {
         config.target = GetRequired(args, "target");
         config.client_count = GetNumber<uint32_t>(args, "clients", 1);
         config.max_inflight = GetNumber<uint32_t>(args, "max-inflight", 64);
+        config.send_server_index = GetNumber<int>(args, "send-server-index", -1);
         config.send_pps = GetNumber<uint64_t>(args, "send-pps", 0);
         config.duration_sec = GetNumber<uint64_t>(args, "duration-sec", 30);
         config.drain_timeout_ms = GetNumber<uint64_t>(args, "drain-timeout-ms", 5000);
@@ -346,6 +349,12 @@ AppConfig LoadConfig(const Args& args) {
         }
         if (config.max_inflight == 0) {
             throw std::runtime_error("--max-inflight must be >= 1");
+        }
+        if (config.send_server_index < -1) {
+            throw std::runtime_error("--send-server-index must be >= -1");
+        }
+        if (config.send_server_index >= static_cast<int>(config.server_count)) {
+            throw std::runtime_error("--send-server-index must be in [0, server-count-1]");
         }
     } else {
         throw std::runtime_error("mode must be 'server' or 'client'");
@@ -1131,6 +1140,11 @@ class LoadClientController : public ITransportEventHandler {
     }
 
   private:
+    bool ShouldSendOnConnection(uint32_t connection_id) const {
+        return config_.send_server_index < 0 ||
+               (connection_id % config_.server_count) == static_cast<uint32_t>(config_.send_server_index);
+    }
+
     void PacerLoop() {
         while (!pacer_stop_.load(std::memory_order_relaxed) && !g_stop_requested.load(std::memory_order_relaxed)) {
             std::vector<uint32_t> ids;
@@ -1169,7 +1183,8 @@ class LoadClientController : public ITransportEventHandler {
                 state.next_send_time_ns = static_cast<double>(NowNs());
             }
 
-            while (!stop_sending_.load(std::memory_order_relaxed) &&
+            while (ShouldSendOnConnection(connection_id) &&
+                   !stop_sending_.load(std::memory_order_relaxed) &&
                    (state.next_sequence - state.echoed_messages) < config_.max_inflight) {
                 if (paced_) {
                     const double now_ns = static_cast<double>(NowNs());
@@ -2092,6 +2107,11 @@ class Client {
         });
     }
 
+    bool ShouldSendOnConnection(const ConnectionContext& connection) const {
+        return config_.send_server_index < 0 ||
+               (connection.index % config_.server_count) == static_cast<uint32_t>(config_.send_server_index);
+    }
+
     void StartPacer() {
         if (!paced_) {
             return;
@@ -2152,7 +2172,8 @@ class Client {
             return;
         }
 
-        while (!stop_sending_.load(std::memory_order_relaxed) &&
+        while (ShouldSendOnConnection(connection) &&
+               !stop_sending_.load(std::memory_order_relaxed) &&
                (stream_ctx.next_sequence - stream_ctx.echoed_messages) < config_.max_inflight) {
             if (paced_) {
                 const double now_ns = static_cast<double>(NowNs());

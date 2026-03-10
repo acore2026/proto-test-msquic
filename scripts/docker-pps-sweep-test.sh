@@ -20,6 +20,16 @@ if [[ -z "${DOCKER_BIN}" ]]; then
   exit 127
 fi
 
+if [[ "${SERVER_COUNT}" -lt 1 ]]; then
+  echo "SERVER_COUNT must be >= 1" >&2
+  exit 2
+fi
+
+if [[ "${CLIENTS}" -lt "${SERVER_COUNT}" ]] || (( CLIENTS % SERVER_COUNT != 0 )); then
+  echo "CLIENTS must be >= SERVER_COUNT and evenly divisible by SERVER_COUNT to keep load balanced" >&2
+  exit 2
+fi
+
 TMP_DIR="$(mktemp -d)"
 
 cleanup() {

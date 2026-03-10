@@ -189,6 +189,22 @@ Fixed-rate test with QUIC:
   --send-pps=10000
 ```
 
+Send traffic only to one server while still keeping connections to the others:
+
+```bash
+./build/msquic-loadtest client \
+  --protocol=msquic \
+  --target=127.0.0.1 \
+  --base-port=15443 \
+  --server-count=4 \
+  --clients=8 \
+  --message-size=1024 \
+  --max-inflight=64 \
+  --send-server-index=2 \
+  --send-pps=10000 \
+  --duration-sec=5
+```
+
 Fixed-rate test with DTLS-over-SCTP in Docker:
 
 ```bash
@@ -227,6 +243,8 @@ Scaling sweep across server and client counts:
 By default this uses a fixed total offered load of `SEND_PPS=10000` across all
 client connections so protocol comparisons stay fair. Set `SEND_PPS=0` if you
 explicitly want flood mode instead.
+It also skips matrix points where clients are not evenly divisible across
+servers, unless `EVEN_DISTRIBUTION=0` is set.
 
 Example with explicit matrix:
 
@@ -256,6 +274,8 @@ SERVER_COUNT=1 \
 
 The sweep scripts print CSV to stdout.
 Their output includes `latency_p50_ms`, `latency_p75_ms`, and `latency_p99_ms`.
+The PPS sweep requires `CLIENTS` to be evenly divisible by `SERVER_COUNT` so
+each server gets the same number of sending connections.
 
 ## Common Options
 
@@ -264,6 +284,7 @@ Their output includes `latency_p50_ms`, `latency_p75_ms`, and `latency_p99_ms`.
 - `--clients=N`
 - `--message-size=N`
 - `--max-inflight=N`
+- `--send-server-index=N`
 - `--duration-sec=N`
 - `--drain-timeout-ms=N`
 - `--stats-interval-ms=N`

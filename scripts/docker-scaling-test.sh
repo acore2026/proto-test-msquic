@@ -12,6 +12,7 @@ STATS_INTERVAL_MS="${STATS_INTERVAL_MS:-1000}"
 SEND_PPS="${SEND_PPS:-10000}"
 SERVER_COUNTS="${SERVER_COUNTS:-1 2 4}"
 CLIENT_COUNTS="${CLIENT_COUNTS:-1 2 4 8}"
+EVEN_DISTRIBUTION="${EVEN_DISTRIBUTION:-1}"
 PROTOCOLS="${PROTOCOLS:-msquic sctp}"
 DOCKER_BIN="${DOCKER_BIN:-$(command -v docker 2>/dev/null || true)}"
 
@@ -87,11 +88,22 @@ summary_to_csv() {
   return 1
 }
 
+has_even_distribution() {
+  local servers="$1"
+  local clients="$2"
+  [[ "${servers}" -ge 1 ]] && [[ "${clients}" -ge "${servers}" ]] && (( clients % servers == 0 ))
+}
+
 echo "protocol,servers,clients,send_pps,sent_messages,echoed_messages,sent_bytes,echoed_bytes,latency_p50_ms,latency_p75_ms,latency_p99_ms"
 
 for protocol in ${PROTOCOLS}; do
   for servers in ${SERVER_COUNTS}; do
     for clients in ${CLIENT_COUNTS}; do
+      if [[ "${EVEN_DISTRIBUTION}" == "1" ]] && ! has_even_distribution "${servers}" "${clients}"; then
+        echo "${protocol},${servers},${clients},${SEND_PPS},SKIPPED,SKIPPED,SKIPPED,SKIPPED,SKIPPED,SKIPPED,SKIPPED"
+        continue
+      fi
+
       server_log="${TMP_DIR}/${protocol}-${servers}-${clients}-server.log"
       client_log="${TMP_DIR}/${protocol}-${servers}-${clients}-client.log"
 
