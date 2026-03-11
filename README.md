@@ -11,7 +11,7 @@ The project provides:
 - multi-listener server in one process
 - multi-connection client in one process
 - fixed-size flood traffic with configurable in-flight depth
-- optional fixed-rate pacing with `--send-pps`
+- optional fixed-rate pacing with `--send-pps` or `--send-pps-per-client`
 - aggregate throughput and RTT latency reporting
 - Docker packaging for a DTLS-over-SCTP-capable test environment
 
@@ -190,6 +190,22 @@ Fixed-rate test with QUIC:
   --send-pps=10000
 ```
 
+Fixed-rate test with QUIC at a fixed PPS per sending client:
+
+```bash
+./build/msquic-loadtest client \
+  --protocol=msquic \
+  --target=127.0.0.1 \
+  --base-port=15443 \
+  --server-count=1 \
+  --clients=8 \
+  --message-size=1024 \
+  --max-inflight=64 \
+  --duration-sec=5 \
+  --drain-timeout-ms=2000 \
+  --send-pps-per-client=1250
+```
+
 Send traffic only to one server while still keeping connections to the others:
 
 ```bash
@@ -242,8 +258,9 @@ Scaling sweep across server and client counts:
 ```
 
 By default this uses a fixed total offered load of `SEND_PPS=10000` across all
-client connections so protocol comparisons stay fair. Set `SEND_PPS=0` if you
-explicitly want flood mode instead.
+client connections so protocol comparisons stay fair. Set `SEND_PPS=0` for
+flood mode, or set `SEND_PPS_PER_CLIENT` to pace each sending connection at the
+same rate.
 It also skips matrix points where clients are not evenly divisible across
 servers, unless `EVEN_DISTRIBUTION=0` is set.
 
@@ -267,6 +284,17 @@ SEND_PPS=10000 \
 ./scripts/docker-scaling-test.sh
 ```
 
+To keep the same rate on each sending connection instead of a cumulative rate:
+
+```bash
+PROTOCOLS="msquic sctp sctp-dtls" \
+SERVER_COUNTS="1 2 4" \
+CLIENT_COUNTS="4 8 16 32" \
+SEND_PPS=0 \
+SEND_PPS_PER_CLIENT=1250 \
+./scripts/docker-scaling-test.sh
+```
+
 Fixed-PPS sweep:
 
 ```bash
@@ -278,6 +306,17 @@ Example with explicit rates:
 ```bash
 PROTOCOLS="msquic sctp" \
 PPS_VALUES="1000 2000 5000 8000 10000 12000" \
+CLIENTS=8 \
+SERVER_COUNT=1 \
+./scripts/docker-pps-sweep-test.sh
+```
+
+Per-client PPS sweep:
+
+```bash
+PROTOCOLS="msquic sctp" \
+PPS_MODE=per-client \
+PPS_VALUES="250 500 1000 1250" \
 CLIENTS=8 \
 SERVER_COUNT=1 \
 ./scripts/docker-pps-sweep-test.sh
@@ -300,6 +339,7 @@ each server gets the same number of sending connections.
 - `--drain-timeout-ms=N`
 - `--stats-interval-ms=N`
 - `--send-pps=N`
+- `--send-pps-per-client=N`
 - `--verify-peer=1`
 - `--sctp-tls=1`
 - `--sctp-nodelay=1`

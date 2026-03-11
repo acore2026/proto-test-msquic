@@ -10,6 +10,7 @@ DURATION_SEC="${DURATION_SEC:-5}"
 DRAIN_TIMEOUT_MS="${DRAIN_TIMEOUT_MS:-2000}"
 STATS_INTERVAL_MS="${STATS_INTERVAL_MS:-1000}"
 SEND_PPS="${SEND_PPS:-10000}"
+SEND_PPS_PER_CLIENT="${SEND_PPS_PER_CLIENT:-0}"
 SERVER_COUNTS="${SERVER_COUNTS:-1 2 4}"
 CLIENT_COUNTS="${CLIENT_COUNTS:-1 2 4 8}"
 EVEN_DISTRIBUTION="${EVEN_DISTRIBUTION:-1}"
@@ -19,6 +20,20 @@ DOCKER_BIN="${DOCKER_BIN:-$(command -v docker 2>/dev/null || true)}"
 if [[ -z "${DOCKER_BIN}" ]]; then
   echo "docker binary not found in PATH" >&2
   exit 127
+fi
+
+if [[ "${SEND_PPS}" != "0" && "${SEND_PPS_PER_CLIENT}" != "0" ]]; then
+  echo "Use only one of SEND_PPS or SEND_PPS_PER_CLIENT" >&2
+  exit 2
+fi
+
+rate_args=()
+rate_label_total="${SEND_PPS}"
+rate_label_per_client="${SEND_PPS_PER_CLIENT}"
+if [[ "${SEND_PPS_PER_CLIENT}" != "0" ]]; then
+  rate_args+=(--send-pps-per-client="${SEND_PPS_PER_CLIENT}")
+else
+  rate_args+=(--send-pps="${SEND_PPS}")
 fi
 
 TMP_DIR="$(mktemp -d)"
@@ -110,13 +125,13 @@ has_even_distribution() {
   [[ "${servers}" -ge 1 ]] && [[ "${clients}" -ge "${servers}" ]] && (( clients % servers == 0 ))
 }
 
-echo "protocol,servers,clients,send_pps,sent_messages,echoed_messages,sent_bytes,echoed_bytes,latency_p50_ms,latency_p75_ms,latency_p99_ms"
+echo "protocol,servers,clients,send_pps,send_pps_per_client,sent_messages,echoed_messages,sent_bytes,echoed_bytes,latency_p50_ms,latency_p75_ms,latency_p99_ms"
 
 for protocol in ${PROTOCOLS}; do
   for servers in ${SERVER_COUNTS}; do
     for clients in ${CLIENT_COUNTS}; do
       if [[ "${EVEN_DISTRIBUTION}" == "1" ]] && ! has_even_distribution "${servers}" "${clients}"; then
-        echo "${protocol},${servers},${clients},${SEND_PPS},SKIPPED,SKIPPED,SKIPPED,SKIPPED,SKIPPED,SKIPPED,SKIPPED"
+        echo "${protocol},${servers},${clients},${rate_label_total},${rate_label_per_client},SKIPPED,SKIPPED,SKIPPED,SKIPPED,SKIPPED,SKIPPED,SKIPPED"
         continue
       fi
 
@@ -162,25 +177,25 @@ for protocol in ${PROTOCOLS}; do
         --duration-sec="${DURATION_SEC}" \
         --drain-timeout-ms="${DRAIN_TIMEOUT_MS}" \
         --stats-interval-ms="${STATS_INTERVAL_MS}" \
-        --send-pps="${SEND_PPS}" \
+        "${rate_args[@]}" \
         >"${client_log}" 2>&1; then
         "${DOCKER_BIN}" logs scale-server >"${server_log}" 2>&1 || true
-        echo "${protocol},${servers},${clients},${SEND_PPS},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR $(tr '\n' ' ' < "${client_log}")"
+        echo "${protocol},${servers},${clients},${rate_label_total},${rate_label_per_client},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR $(tr '\n' ' ' < "${client_log}")"
         continue
       fi
 
       "${DOCKER_BIN}" logs scale-server >"${server_log}" 2>&1 || true
       summary="$(grep '^client summary:' "${client_log}" | tail -1 || true)"
       if [[ -z "${summary}" ]]; then
-        echo "${protocol},${servers},${clients},${SEND_PPS},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR"
+        echo "${protocol},${servers},${clients},${rate_label_total},${rate_label_per_client},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR"
         continue
       fi
       summary="${summary#client summary: }"
       if ! csv_fields="$(summary_to_csv "${summary}")"; then
-        echo "${protocol},${servers},${clients},${SEND_PPS},PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR"
+        echo "${protocol},${servers},${clients},${rate_label_total},${rate_label_per_client},PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR"
         continue
       fi
-      echo "${protocol},${servers},${clients},${SEND_PPS},${csv_fields}"
+      echo "${protocol},${servers},${clients},${rate_label_total},${rate_label_per_client},${csv_fields}"
     done
   done
 done

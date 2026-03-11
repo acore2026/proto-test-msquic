@@ -12,6 +12,7 @@ STATS_INTERVAL_MS="${STATS_INTERVAL_MS:-1000}"
 CLIENTS="${CLIENTS:-8}"
 SERVER_COUNT="${SERVER_COUNT:-1}"
 PPS_VALUES="${PPS_VALUES:-1000 2000 5000 8000 10000 12000}"
+PPS_MODE="${PPS_MODE:-total}"
 PROTOCOLS="${PROTOCOLS:-msquic sctp}"
 DOCKER_BIN="${DOCKER_BIN:-$(command -v docker 2>/dev/null || true)}"
 
@@ -27,6 +28,11 @@ fi
 
 if [[ "${CLIENTS}" -lt "${SERVER_COUNT}" ]] || (( CLIENTS % SERVER_COUNT != 0 )); then
   echo "CLIENTS must be >= SERVER_COUNT and evenly divisible by SERVER_COUNT to keep load balanced" >&2
+  exit 2
+fi
+
+if [[ "${PPS_MODE}" != "total" && "${PPS_MODE}" != "per-client" ]]; then
+  echo "PPS_MODE must be total or per-client" >&2
   exit 2
 fi
 
@@ -65,19 +71,23 @@ protocol_client_args() {
   local protocol="$1"
   local target="$2"
   local pps="$3"
+  local rate_arg="--send-pps=${pps}"
+  if [[ "${PPS_MODE}" == "per-client" ]]; then
+    rate_arg="--send-pps-per-client=${pps}"
+  fi
   if [[ "${protocol}" == "sctp" ]]; then
     printf '%s\n' \
       "client" \
       "--protocol=sctp" \
       "--sctp-tls=1" \
       "--target=${target}" \
-      "--send-pps=${pps}"
+      "${rate_arg}"
   else
     printf '%s\n' \
       "client" \
       "--protocol=msquic" \
       "--target=${target}" \
-      "--send-pps=${pps}"
+      "${rate_arg}"
   fi
 }
 
@@ -97,7 +107,7 @@ summary_to_csv() {
   return 1
 }
 
-echo "protocol,send_pps,sent_messages,echoed_messages,sent_bytes,echoed_bytes,latency_p50_ms,latency_p75_ms,latency_p99_ms"
+echo "protocol,pps_mode,pps_value,sent_messages,echoed_messages,sent_bytes,echoed_bytes,latency_p50_ms,latency_p75_ms,latency_p99_ms"
 
 for protocol in ${PROTOCOLS}; do
   for pps in ${PPS_VALUES}; do
@@ -146,21 +156,21 @@ for protocol in ${PROTOCOLS}; do
       --stats-interval-ms="${STATS_INTERVAL_MS}" \
       >"${client_log}" 2>&1; then
       "${DOCKER_BIN}" logs pps-server >"${server_log}" 2>&1 || true
-      echo "${protocol},${pps},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR $(tr '\n' ' ' < "${client_log}")"
+      echo "${protocol},${PPS_MODE},${pps},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR $(tr '\n' ' ' < "${client_log}")"
       continue
     fi
 
     "${DOCKER_BIN}" logs pps-server >"${server_log}" 2>&1 || true
     summary="$(grep '^client summary:' "${client_log}" | tail -1 || true)"
     if [[ -z "${summary}" ]]; then
-      echo "${protocol},${pps},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR"
+      echo "${protocol},${PPS_MODE},${pps},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR"
       continue
     fi
     summary="${summary#client summary: }"
     if ! csv_fields="$(summary_to_csv "${summary}")"; then
-      echo "${protocol},${pps},PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR"
+      echo "${protocol},${PPS_MODE},${pps},PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR"
       continue
     fi
-    echo "${protocol},${pps},${csv_fields}"
+    echo "${protocol},${PPS_MODE},${pps},${csv_fields}"
   done
 done

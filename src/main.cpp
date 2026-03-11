@@ -263,6 +263,7 @@ void PrintUsage() {
         << "  --max-inflight=N           Max outstanding echoed messages per connection, default 64\n"
         << "  --send-server-index=N      Only send on connections mapped to this server index, default all\n"
         << "  --send-pps=N               Total offered message rate across all clients, default unlimited\n"
+        << "  --send-pps-per-client=N    Offered message rate per sending client connection, default disabled\n"
         << "  --duration-sec=N           Active send duration, default 30\n"
         << "  --drain-timeout-ms=N       Drain time after send stop, default 5000\n"
         << "  --verify-peer=1            Enable certificate validation, default disabled\n"
@@ -293,6 +294,7 @@ struct AppConfig {
     uint32_t max_inflight{64};
     int send_server_index{-1};
     uint64_t send_pps{0};
+    uint64_t send_pps_per_client{0};
     uint64_t duration_sec{30};
     uint64_t drain_timeout_ms{5000};
     bool verify_peer{false};
@@ -341,6 +343,7 @@ AppConfig LoadConfig(const Args& args) {
         config.max_inflight = GetNumber<uint32_t>(args, "max-inflight", 64);
         config.send_server_index = GetNumber<int>(args, "send-server-index", -1);
         config.send_pps = GetNumber<uint64_t>(args, "send-pps", 0);
+        config.send_pps_per_client = GetNumber<uint64_t>(args, "send-pps-per-client", 0);
         config.duration_sec = GetNumber<uint64_t>(args, "duration-sec", 30);
         config.drain_timeout_ms = GetNumber<uint64_t>(args, "drain-timeout-ms", 5000);
         config.verify_peer = GetBool(args, "verify-peer", false);
@@ -356,11 +359,31 @@ AppConfig LoadConfig(const Args& args) {
         if (config.send_server_index >= static_cast<int>(config.server_count)) {
             throw std::runtime_error("--send-server-index must be in [0, server-count-1]");
         }
+        if (config.send_pps > 0 && config.send_pps_per_client > 0) {
+            throw std::runtime_error("use only one of --send-pps or --send-pps-per-client");
+        }
     } else {
         throw std::runtime_error("mode must be 'server' or 'client'");
     }
 
     return config;
+}
+
+uint32_t ActiveSendConnectionCount(const AppConfig& config) {
+    if (config.client_count == 0) {
+        return 0;
+    }
+    if (config.send_server_index < 0) {
+        return config.client_count;
+    }
+
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < config.client_count; ++i) {
+        if ((i % config.server_count) == static_cast<uint32_t>(config.send_server_index)) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 #pragma pack(push, 1)
@@ -1041,6 +1064,7 @@ struct LoadClientConnectionState {
     std::vector<uint8_t> receive_buffer;
     uint64_t next_sequence{0};
     uint64_t echoed_messages{0};
+    double next_send_time_ns{0.0};
     bool connected{false};
     bool send_closed{false};
 };
@@ -1050,10 +1074,10 @@ class LoadClientController : public ITransportEventHandler {
     LoadClientController(const AppConfig& config, Stats& stats)
         : config_(config),
           stats_(stats),
-          paced_(config.send_pps > 0),
-          pacing_interval_ns_(paced_
-                                  ? 1'000'000'000.0 / static_cast<double>(config.send_pps)
-                                  : 0.0) {}
+          pacing_mode_(DeterminePacingMode(config)),
+          paced_(pacing_mode_ != PacingMode::Unlimited),
+          active_send_connection_count_(ActiveSendConnectionCount(config)),
+          pacing_interval_ns_(ComputePacingIntervalNs(config, pacing_mode_, active_send_connection_count_)) {}
 
     ~LoadClientController() {
         StopPacer();
@@ -1169,13 +1193,48 @@ class LoadClientController : public ITransportEventHandler {
     }
 
   private:
+    enum class PacingMode {
+        Unlimited,
+        TotalPps,
+        PerClientPps,
+    };
+
+    static PacingMode DeterminePacingMode(const AppConfig& config) {
+        if (config.send_pps_per_client > 0) {
+            return PacingMode::PerClientPps;
+        }
+        if (config.send_pps > 0) {
+            return PacingMode::TotalPps;
+        }
+        return PacingMode::Unlimited;
+    }
+
+    static double ComputePacingIntervalNs(
+        const AppConfig& config,
+        PacingMode pacing_mode,
+        uint32_t active_send_connection_count) {
+        switch (pacing_mode) {
+        case PacingMode::Unlimited:
+            return 0.0;
+        case PacingMode::TotalPps:
+            return config.send_pps == 0
+                       ? 0.0
+                       : 1'000'000'000.0 / static_cast<double>(config.send_pps);
+        case PacingMode::PerClientPps:
+            return config.send_pps_per_client == 0 || active_send_connection_count == 0
+                       ? 0.0
+                       : 1'000'000'000.0 / static_cast<double>(config.send_pps_per_client);
+        }
+        return 0.0;
+    }
+
     bool ShouldSendOnConnection(uint32_t connection_id) const {
         return config_.send_server_index < 0 ||
                (connection_id % config_.server_count) == static_cast<uint32_t>(config_.send_server_index);
     }
 
     void PacerLoop() {
-        if (paced_ && global_next_send_time_ns_ == 0.0) {
+        if (pacing_mode_ == PacingMode::TotalPps && global_next_send_time_ns_ == 0.0) {
             global_next_send_time_ns_ = static_cast<double>(NowNs());
         }
 
@@ -1203,7 +1262,7 @@ class LoadClientController : public ITransportEventHandler {
             }
 
             const double now_ns = static_cast<double>(NowNs());
-            if (paced_ && global_next_send_time_ns_ > now_ns) {
+            if (pacing_mode_ == PacingMode::TotalPps && global_next_send_time_ns_ > now_ns) {
                 const auto sleep_ns = static_cast<int64_t>(std::min(global_next_send_time_ns_ - now_ns, 500'000.0));
                 std::this_thread::sleep_for(std::chrono::nanoseconds(std::max<int64_t>(sleep_ns, 50'000)));
                 continue;
@@ -1215,10 +1274,13 @@ class LoadClientController : public ITransportEventHandler {
                     const size_t idx = (start + attempt) % ids.size();
                     const uint32_t id = ids[idx];
                     try {
+                        if (!MaySendPacedMessage(id, now_ns)) {
+                            continue;
+                        }
                         if (PumpSends(id, 1) > 0) {
                             did_work = true;
                             next_paced_connection_index_ = idx + 1;
-                            if (paced_) {
+                            if (pacing_mode_ == PacingMode::TotalPps) {
                                 global_next_send_time_ns_ += pacing_interval_ns_;
                                 if (global_next_send_time_ns_ + (pacing_interval_ns_ * 4.0) < now_ns) {
                                     global_next_send_time_ns_ = now_ns;
@@ -1236,6 +1298,36 @@ class LoadClientController : public ITransportEventHandler {
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
             }
         }
+    }
+
+    bool MaySendPacedMessage(uint32_t connection_id, double now_ns) {
+        if (pacing_mode_ == PacingMode::Unlimited) {
+            return true;
+        }
+        if (pacing_mode_ == PacingMode::TotalPps) {
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = states_.find(connection_id);
+        if (it == states_.end()) {
+            return false;
+        }
+        auto& state = it->second;
+        if (!state.connected || state.connection == nullptr || state.send_closed || !ShouldSendOnConnection(connection_id)) {
+            return false;
+        }
+        if (state.next_send_time_ns == 0.0) {
+            state.next_send_time_ns = now_ns;
+        }
+        if (state.next_send_time_ns > now_ns) {
+            return false;
+        }
+        state.next_send_time_ns += pacing_interval_ns_;
+        if (state.next_send_time_ns + (pacing_interval_ns_ * 4.0) < now_ns) {
+            state.next_send_time_ns = now_ns;
+        }
+        return true;
     }
 
     size_t PumpSends(uint32_t connection_id, size_t max_messages = std::numeric_limits<size_t>::max()) {
@@ -1306,7 +1398,9 @@ class LoadClientController : public ITransportEventHandler {
     std::map<uint32_t, LoadClientConnectionState> states_;
     std::set<uint32_t> closed_connections_;
     std::atomic<bool> stop_sending_{false};
+    const PacingMode pacing_mode_{PacingMode::Unlimited};
     const bool paced_{false};
+    const uint32_t active_send_connection_count_{0};
     const double pacing_interval_ns_{0.0};
     double global_next_send_time_ns_{0.0};
     size_t next_paced_connection_index_{0};
@@ -2049,11 +2143,10 @@ class Client {
           registration_(api_, "msquic-loadtest-client"),
           configuration_(api_, registration_.get(), config_, true),
           stats_printer_("client", stats_, config_.stats_interval_ms),
-          paced_(config.send_pps > 0),
-          pacing_interval_ns_(paced_
-                                  ? (1'000'000'000.0 * static_cast<double>(config.client_count)) /
-                                        static_cast<double>(config.send_pps)
-                                  : 0.0) {}
+          pacing_mode_(DeterminePacingMode(config)),
+          paced_(pacing_mode_ != PacingMode::Unlimited),
+          active_send_connection_count_(ActiveSendConnectionCount(config)),
+          pacing_interval_ns_(ComputePacingIntervalNs(config, pacing_mode_, active_send_connection_count_)) {}
 
     ~Client() {
         StopPacer();
@@ -2097,6 +2190,42 @@ class Client {
     }
 
   private:
+    enum class PacingMode {
+        Unlimited,
+        TotalPps,
+        PerClientPps,
+    };
+
+    static PacingMode DeterminePacingMode(const AppConfig& config) {
+        if (config.send_pps_per_client > 0) {
+            return PacingMode::PerClientPps;
+        }
+        if (config.send_pps > 0) {
+            return PacingMode::TotalPps;
+        }
+        return PacingMode::Unlimited;
+    }
+
+    static double ComputePacingIntervalNs(
+        const AppConfig& config,
+        PacingMode pacing_mode,
+        uint32_t active_send_connection_count) {
+        switch (pacing_mode) {
+        case PacingMode::Unlimited:
+            return 0.0;
+        case PacingMode::TotalPps:
+            return config.send_pps == 0 || active_send_connection_count == 0
+                       ? 0.0
+                       : (1'000'000'000.0 * static_cast<double>(active_send_connection_count)) /
+                             static_cast<double>(config.send_pps);
+        case PacingMode::PerClientPps:
+            return config.send_pps_per_client == 0 || active_send_connection_count == 0
+                       ? 0.0
+                       : 1'000'000'000.0 / static_cast<double>(config.send_pps_per_client);
+        }
+        return 0.0;
+    }
+
     struct ConnectionContext;
 
     struct StreamContext {
@@ -2259,9 +2388,11 @@ class Client {
                 if (stream_ctx.next_send_time_ns > now_ns) {
                     break;
                 }
-                stream_ctx.next_send_time_ns += pacing_interval_ns_;
-                if (stream_ctx.next_send_time_ns + (pacing_interval_ns_ * 4.0) < now_ns) {
-                    stream_ctx.next_send_time_ns = now_ns;
+                if (pacing_interval_ns_ > 0.0) {
+                    stream_ctx.next_send_time_ns += pacing_interval_ns_;
+                    if (stream_ctx.next_send_time_ns + (pacing_interval_ns_ * 4.0) < now_ns) {
+                        stream_ctx.next_send_time_ns = now_ns;
+                    }
                 }
             }
 
@@ -2437,7 +2568,9 @@ class Client {
     std::mutex done_mutex_;
     std::condition_variable done_cv_;
     std::atomic<bool> stop_sending_{false};
+    const PacingMode pacing_mode_{PacingMode::Unlimited};
     const bool paced_{false};
+    const uint32_t active_send_connection_count_{0};
     const double pacing_interval_ns_{0.0};
     std::atomic<bool> pacer_stop_{false};
     std::thread pacer_thread_;
