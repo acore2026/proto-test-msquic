@@ -27,6 +27,7 @@ Implemented today:
 - DTLS-over-SCTP support in the Docker image build
 - plain SCTP is available without DTLS by omitting `--sctp-tls=1`
 - benchmark helper scripts for scaling and PPS sweeps
+- a dedicated N2 benchmark bundle under [benchmarks/n2/README.md](/home/administrator/msquic-test/benchmarks/n2/README.md)
 - GitHub Actions for image builds and tag-based releases
 
 Useful defaults:
@@ -244,6 +245,11 @@ docker run --rm \
 ```
 
 ## Benchmark Helper Scripts
+
+For AMF <-> gNB N2 benchmarking specifically, use the separate bundle in
+[benchmarks/n2/README.md](/home/administrator/msquic-test/benchmarks/n2/README.md).
+It wraps the generic scripts with N2-oriented defaults, writes timestamped
+result bundles, and generates a report skeleton.
 
 Quick demo:
 

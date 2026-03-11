@@ -94,15 +94,29 @@ protocol_client_args() {
 
 summary_to_csv() {
   local summary="$1"
-  if [[ "${summary}" =~ sent_messages=([0-9]+)\ echoed_messages=([0-9]+)\ sent_bytes=([0-9]+)\ echoed_bytes=([0-9]+)\ latency_ms\(p50/p75/p99\)=([^/]+)/([^/]+)/([^[:space:]]+) ]]; then
+  if [[ "${summary}" =~ sent_messages=([0-9]+)\ echoed_messages=([0-9]+)\ sent_bytes=([0-9]+)\ echoed_bytes=([0-9]+)\ latency_ms\(p50/p75/p99\)=([^[:space:]]+) ]]; then
+    local latency="${BASH_REMATCH[5]}"
+    local latency_p50=""
+    local latency_p75=""
+    local latency_p99=""
+    if [[ "${latency}" == "n/a/n/a/n/a" ]]; then
+      latency_p50="n/a"
+      latency_p75="n/a"
+      latency_p99="n/a"
+    else
+      IFS='/' read -r latency_p50 latency_p75 latency_p99 <<<"${latency}"
+      if [[ -z "${latency_p50:-}" || -z "${latency_p75:-}" || -z "${latency_p99:-}" ]]; then
+        return 1
+      fi
+    fi
     printf '%s,%s,%s,%s,%s,%s,%s\n' \
       "${BASH_REMATCH[1]}" \
       "${BASH_REMATCH[2]}" \
       "${BASH_REMATCH[3]}" \
       "${BASH_REMATCH[4]}" \
-      "${BASH_REMATCH[5]}" \
-      "${BASH_REMATCH[6]}" \
-      "${BASH_REMATCH[7]}"
+      "${latency_p50}" \
+      "${latency_p75}" \
+      "${latency_p99}"
     return 0
   fi
   return 1
