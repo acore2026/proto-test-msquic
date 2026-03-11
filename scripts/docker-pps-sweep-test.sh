@@ -152,10 +152,11 @@ cpu_stats_for_container() {
   local container="$2"
   awk -F, -v container="${container}" '
     $1 == container {
-      sum += $2;
+      value = $2 + 0;
+      sum += value;
       count += 1;
-      if ($2 > max) {
-        max = $2;
+      if (count == 1 || value > max) {
+        max = value;
       }
     }
     END {
