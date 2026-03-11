@@ -1041,7 +1041,6 @@ struct LoadClientConnectionState {
     std::vector<uint8_t> receive_buffer;
     uint64_t next_sequence{0};
     uint64_t echoed_messages{0};
-    double next_send_time_ns{0.0};
     bool connected{false};
     bool send_closed{false};
 };
@@ -1053,8 +1052,7 @@ class LoadClientController : public ITransportEventHandler {
           stats_(stats),
           paced_(config.send_pps > 0),
           pacing_interval_ns_(paced_
-                                  ? (1'000'000'000.0 * static_cast<double>(config.client_count)) /
-                                        static_cast<double>(config.send_pps)
+                                  ? 1'000'000'000.0 / static_cast<double>(config.send_pps)
                                   : 0.0) {}
 
     ~LoadClientController() {
@@ -1082,7 +1080,6 @@ class LoadClientController : public ITransportEventHandler {
             auto& state = states_[connection->Id()];
             state.connection = connection;
             state.connected = true;
-            state.next_send_time_ns = static_cast<double>(NowNs());
         }
         std::cerr << ProtocolName(config_.protocol) << " client connection " << connection->Id() << " established" << std::endl;
         if (!paced_) {
@@ -1142,7 +1139,7 @@ class LoadClientController : public ITransportEventHandler {
         }
         for (uint32_t id : ids) {
             try {
-                PumpSends(id);
+                PumpSends(id, 0);
             } catch (const std::exception& ex) {
                 OnTransportError(id, ex.what());
             }
@@ -1178,6 +1175,10 @@ class LoadClientController : public ITransportEventHandler {
     }
 
     void PacerLoop() {
+        if (paced_ && global_next_send_time_ns_ == 0.0) {
+            global_next_send_time_ns_ = static_cast<double>(NowNs());
+        }
+
         while (!pacer_stop_.load(std::memory_order_relaxed) && !g_stop_requested.load(std::memory_order_relaxed)) {
             std::vector<uint32_t> ids;
             {
@@ -1187,18 +1188,57 @@ class LoadClientController : public ITransportEventHandler {
                     ids.push_back(id);
                 }
             }
-            for (uint32_t id : ids) {
-                try {
-                    PumpSends(id);
-                } catch (const std::exception& ex) {
-                    OnTransportError(id, ex.what());
+            bool did_work = false;
+
+            if (stop_sending_.load(std::memory_order_relaxed)) {
+                for (uint32_t id : ids) {
+                    try {
+                        PumpSends(id, 0);
+                    } catch (const std::exception& ex) {
+                        OnTransportError(id, ex.what());
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                continue;
+            }
+
+            const double now_ns = static_cast<double>(NowNs());
+            if (paced_ && global_next_send_time_ns_ > now_ns) {
+                const auto sleep_ns = static_cast<int64_t>(std::min(global_next_send_time_ns_ - now_ns, 500'000.0));
+                std::this_thread::sleep_for(std::chrono::nanoseconds(std::max<int64_t>(sleep_ns, 50'000)));
+                continue;
+            }
+
+            if (!ids.empty()) {
+                const size_t start = next_paced_connection_index_ % ids.size();
+                for (size_t attempt = 0; attempt < ids.size(); ++attempt) {
+                    const size_t idx = (start + attempt) % ids.size();
+                    const uint32_t id = ids[idx];
+                    try {
+                        if (PumpSends(id, 1) > 0) {
+                            did_work = true;
+                            next_paced_connection_index_ = idx + 1;
+                            if (paced_) {
+                                global_next_send_time_ns_ += pacing_interval_ns_;
+                                if (global_next_send_time_ns_ + (pacing_interval_ns_ * 4.0) < now_ns) {
+                                    global_next_send_time_ns_ = now_ns;
+                                }
+                            }
+                            break;
+                        }
+                    } catch (const std::exception& ex) {
+                        OnTransportError(id, ex.what());
+                    }
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+            if (!did_work) {
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
         }
     }
 
-    void PumpSends(uint32_t connection_id) {
+    size_t PumpSends(uint32_t connection_id, size_t max_messages = std::numeric_limits<size_t>::max()) {
         std::shared_ptr<ITransportConnection> connection;
         std::vector<std::vector<uint8_t>> sends;
         bool should_close_send = false;
@@ -1207,31 +1247,18 @@ class LoadClientController : public ITransportEventHandler {
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = states_.find(connection_id);
             if (it == states_.end()) {
-                return;
+                return 0;
             }
             auto& state = it->second;
             if (!state.connected || state.connection == nullptr || state.send_closed) {
-                return;
+                return 0;
             }
             connection = state.connection;
 
-            if (paced_ && state.next_send_time_ns == 0.0) {
-                state.next_send_time_ns = static_cast<double>(NowNs());
-            }
-
             while (ShouldSendOnConnection(connection_id) &&
+                   sends.size() < max_messages &&
                    !stop_sending_.load(std::memory_order_relaxed) &&
                    (state.next_sequence - state.echoed_messages) < config_.max_inflight) {
-                if (paced_) {
-                    const double now_ns = static_cast<double>(NowNs());
-                    if (state.next_send_time_ns > now_ns) {
-                        break;
-                    }
-                    state.next_send_time_ns += pacing_interval_ns_;
-                    if (state.next_send_time_ns + (pacing_interval_ns_ * 4.0) < now_ns) {
-                        state.next_send_time_ns = now_ns;
-                    }
-                }
                 std::vector<uint8_t> frame(config_.message_size);
                 MessageHeader header{};
                 header.magic = kMessageMagic;
@@ -1269,6 +1296,7 @@ class LoadClientController : public ITransportEventHandler {
                 throw;
             }
         }
+        return sends.size();
     }
 
     const AppConfig& config_;
@@ -1280,6 +1308,8 @@ class LoadClientController : public ITransportEventHandler {
     std::atomic<bool> stop_sending_{false};
     const bool paced_{false};
     const double pacing_interval_ns_{0.0};
+    double global_next_send_time_ns_{0.0};
+    size_t next_paced_connection_index_{0};
     std::atomic<bool> pacer_stop_{false};
     std::thread pacer_thread_;
 };
@@ -1579,11 +1609,11 @@ class SctpClient {
           transport_(config_, controller_) {}
 
     void Run() {
+        transport_.Start();
         const auto deadline = Clock::now() + std::chrono::seconds(config_.duration_sec);
         const auto drain_deadline = deadline + std::chrono::milliseconds(config_.drain_timeout_ms);
 
         controller_.StartPacer();
-        transport_.Start();
         stats_printer_.Start();
 
         while (!g_stop_requested.load(std::memory_order_relaxed)) {
@@ -2030,11 +2060,11 @@ class Client {
     }
 
     void Run() {
+        StartConnections();
         deadline_ = Clock::now() + std::chrono::seconds(config_.duration_sec);
         drain_deadline_ = deadline_ + std::chrono::milliseconds(config_.drain_timeout_ms);
 
         StartPacer();
-        StartConnections();
         stats_printer_.Start();
 
         while (!g_stop_requested.load(std::memory_order_relaxed)) {
