@@ -323,7 +323,10 @@ SERVER_COUNT=1 \
 ```
 
 The sweep scripts print CSV to stdout.
-Their output includes `latency_p50_ms`, `latency_p75_ms`, and `latency_p99_ms`.
+Their output includes `latency_p50_ms`, `latency_p75_ms`, `latency_p99_ms`,
+plus Docker-observed `server_cpu_avg_pct`, `server_cpu_max_pct`,
+`client_cpu_avg_pct`, and `client_cpu_max_pct`.
+CPU sampling defaults to `CPU_SAMPLE_INTERVAL_SEC=0.5` and can be overridden.
 The PPS sweep requires `CLIENTS` to be evenly divisible by `SERVER_COUNT` so
 each server gets the same number of sending connections.
 
