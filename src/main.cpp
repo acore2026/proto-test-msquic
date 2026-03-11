@@ -859,10 +859,13 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
         if (!send_closed_.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
             return;
         }
+        if (fd_.load(std::memory_order_relaxed) < 0) {
+            return;
+        }
         if (ssl_ != nullptr) {
             SSL_shutdown(ssl_);
         }
-        if (::shutdown(fd_, SHUT_WR) != 0 && errno != ENOTCONN) {
+        if (::shutdown(fd_, SHUT_WR) != 0 && errno != ENOTCONN && errno != EBADF) {
             throw std::runtime_error(SocketErrorString("shutdown(SHUT_WR)"));
         }
     }
@@ -1138,7 +1141,11 @@ class LoadClientController : public ITransportEventHandler {
             }
         }
         for (uint32_t id : ids) {
-            PumpSends(id);
+            try {
+                PumpSends(id);
+            } catch (const std::exception& ex) {
+                OnTransportError(id, ex.what());
+            }
         }
     }
 

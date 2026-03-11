@@ -13,7 +13,7 @@ SEND_PPS="${SEND_PPS:-10000}"
 SERVER_COUNTS="${SERVER_COUNTS:-1 2 4}"
 CLIENT_COUNTS="${CLIENT_COUNTS:-1 2 4 8}"
 EVEN_DISTRIBUTION="${EVEN_DISTRIBUTION:-1}"
-PROTOCOLS="${PROTOCOLS:-msquic sctp}"
+PROTOCOLS="${PROTOCOLS:-msquic sctp sctp-dtls}"
 DOCKER_BIN="${DOCKER_BIN:-$(command -v docker 2>/dev/null || true)}"
 
 if [[ -z "${DOCKER_BIN}" ]]; then
@@ -39,16 +39,23 @@ protocol_server_args() {
   if [[ "${protocol}" == "sctp" ]]; then
     printf '%s\n' \
       "server" \
+      "--protocol=sctp"
+  elif [[ "${protocol}" == "sctp-dtls" ]]; then
+    printf '%s\n' \
+      "server" \
       "--protocol=sctp" \
       "--sctp-tls=1" \
       "--cert=/opt/msquic-loadtest/certs/server.crt" \
       "--key=/opt/msquic-loadtest/certs/server.key"
-  else
+  elif [[ "${protocol}" == "msquic" ]]; then
     printf '%s\n' \
       "server" \
       "--protocol=msquic" \
       "--cert=/opt/msquic-loadtest/certs/server.crt" \
       "--key=/opt/msquic-loadtest/certs/server.key"
+  else
+    echo "unsupported protocol '${protocol}'" >&2
+    exit 2
   fi
 }
 
@@ -60,15 +67,24 @@ protocol_client_args() {
     printf '%s\n' \
       "client" \
       "--protocol=sctp" \
+      "--target=${target}" \
+      "--clients=${clients}"
+  elif [[ "${protocol}" == "sctp-dtls" ]]; then
+    printf '%s\n' \
+      "client" \
+      "--protocol=sctp" \
       "--sctp-tls=1" \
       "--target=${target}" \
       "--clients=${clients}"
-  else
+  elif [[ "${protocol}" == "msquic" ]]; then
     printf '%s\n' \
       "client" \
       "--protocol=msquic" \
       "--target=${target}" \
       "--clients=${clients}"
+  else
+    echo "unsupported protocol '${protocol}'" >&2
+    exit 2
   fi
 }
 
@@ -111,7 +127,7 @@ for protocol in ${PROTOCOLS}; do
       mapfile -t client_args < <(protocol_client_args "${protocol}" "scale-server" "${clients}")
       server_run_opts=()
       client_run_opts=()
-      if [[ "${protocol}" == "sctp" ]]; then
+      if [[ "${protocol}" == "sctp-dtls" ]]; then
         server_run_opts+=(--sysctl net.sctp.auth_enable=1)
         client_run_opts+=(--sysctl net.sctp.auth_enable=1)
       fi

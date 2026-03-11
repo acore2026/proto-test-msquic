@@ -25,6 +25,7 @@ Implemented today:
 - `msquic` transport
 - Linux `sctp` transport
 - DTLS-over-SCTP support in the Docker image build
+- plain SCTP is available without DTLS by omitting `--sctp-tls=1`
 - benchmark helper scripts for scaling and PPS sweeps
 - GitHub Actions for image builds and tag-based releases
 
@@ -252,6 +253,16 @@ Example with explicit matrix:
 PROTOCOLS="msquic sctp" \
 SERVER_COUNTS="1 2 4" \
 CLIENT_COUNTS="1 2 4 8" \
+SEND_PPS=10000 \
+./scripts/docker-scaling-test.sh
+```
+
+To compare all three transport variants explicitly:
+
+```bash
+PROTOCOLS="msquic sctp sctp-dtls" \
+SERVER_COUNTS="1 2 4" \
+CLIENT_COUNTS="4 8 16 32" \
 SEND_PPS=10000 \
 ./scripts/docker-scaling-test.sh
 ```
