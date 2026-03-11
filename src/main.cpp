@@ -769,9 +769,23 @@ class SctpTlsContext {
 class SctpConnection : public ITransportConnection, public std::enable_shared_from_this<SctpConnection> {
   public:
     SctpConnection(int fd, uint32_t id, uint16_t stream_id, ITransportEventHandler& handler, SSL* ssl)
-        : fd_(fd), id_(id), stream_id_(stream_id), handler_(handler), ssl_(ssl) {}
+        : fd_(fd), id_(id), stream_id_(stream_id), handler_(handler), ssl_(ssl) {
+        timeval timeout{};
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 200000;
+        if (::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
+            throw std::runtime_error(SocketErrorString("setsockopt(SO_RCVTIMEO)"));
+        }
+    }
 
     ~SctpConnection() override {
+        if (recv_thread_.joinable()) {
+            if (recv_thread_.get_id() == std::this_thread::get_id()) {
+                recv_thread_.detach();
+            } else {
+                recv_thread_.join();
+            }
+        }
         if (ssl_ != nullptr) {
             SSL_free(ssl_);
         }
@@ -876,6 +890,11 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
                     const int ssl_error = SSL_get_error(ssl_, ok);
                     if (ssl_error == SSL_ERROR_ZERO_RETURN) {
                         bytes = 0;
+                    } else if (ssl_error == SSL_ERROR_SYSCALL && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        if (closed_.load(std::memory_order_relaxed)) {
+                            break;
+                        }
+                        continue;
                     } else if (ssl_error == SSL_ERROR_SYSCALL && errno != 0) {
                         bytes = -1;
                     } else {
@@ -904,6 +923,12 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
                 break;
             }
             if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (closed_.load(std::memory_order_relaxed)) {
+                    break;
+                }
                 continue;
             }
             if (errno == ENOTCONN || errno == ECONNRESET || errno == EPIPE) {
@@ -1156,7 +1181,11 @@ class LoadClientController : public ITransportEventHandler {
                 }
             }
             for (uint32_t id : ids) {
-                PumpSends(id);
+                try {
+                    PumpSends(id);
+                } catch (const std::exception& ex) {
+                    OnTransportError(id, ex.what());
+                }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -1217,11 +1246,21 @@ class LoadClientController : public ITransportEventHandler {
         }
 
         for (const auto& frame : sends) {
-            connection->SendCopy(frame.data(), frame.size());
-            stats_.AddSent(frame.size());
+            try {
+                connection->SendCopy(frame.data(), frame.size());
+                stats_.AddSent(frame.size());
+            } catch (const std::exception& ex) {
+                connection->Close();
+                throw;
+            }
         }
         if (should_close_send) {
-            connection->CloseSend();
+            try {
+                connection->CloseSend();
+            } catch (const std::exception&) {
+                connection->Close();
+                throw;
+            }
         }
     }
 
