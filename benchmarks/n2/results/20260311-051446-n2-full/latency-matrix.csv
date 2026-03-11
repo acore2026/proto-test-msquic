@@ -1,0 +1,2 @@
+protocol,servers,clients,send_pps,send_pps_per_client,sent_messages,echoed_messages,sent_bytes,echoed_bytes,latency_p50_ms,latency_p75_ms,latency_p99_ms,server_cpu_avg_pct,server_cpu_max_pct,client_cpu_avg_pct,client_cpu_max_pct
+sctp-dtls,2,32,0,5,48,0,12288,0,n,a,n/a/n/a,4.38,7.32,4.38,4.96
