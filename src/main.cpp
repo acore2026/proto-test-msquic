@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <netdb.h>
+#include <poll.h>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -835,6 +836,74 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
         recv_thread_ = std::thread([self = shared_from_this()]() { self->ReceiveLoop(); });
     }
 
+    int Fd() const {
+        return fd_.load(std::memory_order_relaxed);
+    }
+
+    bool UsesExternalPolling() const {
+        return ssl_ != nullptr;
+    }
+
+    bool HandlePollEvents(short revents) {
+        if (closed_.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        if ((revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            Close();
+            handler_.OnClosed(id_);
+            return false;
+        }
+
+        while (!closed_.load(std::memory_order_relaxed) && !g_stop_requested.load(std::memory_order_relaxed)) {
+            size_t read = 0;
+            int ok = 0;
+            int ssl_error = 0;
+            {
+                std::lock_guard<std::mutex> lock(ssl_mutex_);
+                ok = SSL_read_ex(ssl_, poll_buffer_.data(), poll_buffer_.size(), &read);
+                if (ok != 1) {
+                    ssl_error = SSL_get_error(ssl_, ok);
+                }
+            }
+
+            if (ok == 1) {
+                try {
+                    handler_.OnData(shared_from_this(), poll_buffer_.data(), read);
+                } catch (const std::exception& ex) {
+                    handler_.OnTransportError(id_, ex.what());
+                    Close();
+                    handler_.OnClosed(id_);
+                    return false;
+                }
+                continue;
+            }
+
+            if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+                return true;
+            }
+            if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+                try {
+                    handler_.OnPeerClosed(shared_from_this());
+                } catch (const std::exception& ex) {
+                    handler_.OnTransportError(id_, ex.what());
+                }
+                Close();
+                handler_.OnClosed(id_);
+                return false;
+            }
+            if (ssl_error == SSL_ERROR_SYSCALL && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                return true;
+            }
+
+            handler_.OnTransportError(id_, OpenSslErrorString("SSL_read_ex"));
+            Close();
+            handler_.OnClosed(id_);
+            return false;
+        }
+
+        return !closed_.load(std::memory_order_relaxed);
+    }
+
     void Join() {
         if (recv_thread_.joinable()) {
             recv_thread_.join();
@@ -847,20 +916,34 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
         }
 
         if (ssl_ != nullptr) {
-            std::lock_guard<std::mutex> lock(ssl_mutex_);
             size_t offset = 0;
             while (offset < length) {
                 size_t written = 0;
-                if (SSL_write_ex(ssl_, data + offset, length - offset, &written) != 1) {
-                    const int ssl_error = SSL_get_error(ssl_, 0);
-                    if ((ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) &&
-                        !closed_.load(std::memory_order_relaxed)) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                        continue;
+                int ok = 0;
+                int ssl_error = 0;
+                {
+                    std::lock_guard<std::mutex> lock(ssl_mutex_);
+                    ok = SSL_write_ex(ssl_, data + offset, length - offset, &written);
+                    if (ok != 1) {
+                        ssl_error = SSL_get_error(ssl_, ok);
                     }
-                    throw std::runtime_error(OpenSslErrorString("SSL_write_ex"));
                 }
-                offset += written;
+                if (ok == 1) {
+                    offset += written;
+                    continue;
+                }
+                if (closed_.load(std::memory_order_relaxed)) {
+                    return;
+                }
+                if (ssl_error == SSL_ERROR_WANT_READ) {
+                    WaitForSocketReady(POLLIN);
+                    continue;
+                }
+                if (ssl_error == SSL_ERROR_WANT_WRITE) {
+                    WaitForSocketReady(POLLOUT);
+                    continue;
+                }
+                throw std::runtime_error(OpenSslErrorString("SSL_write_ex"));
             }
             return;
         }
@@ -922,6 +1005,29 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
     }
 
   private:
+    void WaitForSocketReady(short events) {
+        const int fd = fd_.load(std::memory_order_relaxed);
+        if (fd < 0 || closed_.load(std::memory_order_relaxed)) {
+            return;
+        }
+
+        pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = events;
+        while (!closed_.load(std::memory_order_relaxed) && !g_stop_requested.load(std::memory_order_relaxed)) {
+            const int rc = ::poll(&pfd, 1, -1);
+            if (rc > 0) {
+                return;
+            }
+            if (rc == 0) {
+                continue;
+            }
+            if (errno != EINTR) {
+                return;
+            }
+        }
+    }
+
     void ReceiveLoop() {
         std::vector<uint8_t> buffer(64 * 1024);
 
@@ -943,9 +1049,11 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
                 } else {
                     if (ssl_error == SSL_ERROR_ZERO_RETURN) {
                         bytes = 0;
-                    } else if ((ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) &&
-                               !closed_.load(std::memory_order_relaxed)) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    } else if (!closed_.load(std::memory_order_relaxed) && ssl_error == SSL_ERROR_WANT_READ) {
+                        WaitForSocketReady(POLLIN);
+                        continue;
+                    } else if (!closed_.load(std::memory_order_relaxed) && ssl_error == SSL_ERROR_WANT_WRITE) {
+                        WaitForSocketReady(POLLOUT);
                         continue;
                     } else if (ssl_error == SSL_ERROR_SYSCALL && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                         if (closed_.load(std::memory_order_relaxed)) {
@@ -1022,6 +1130,7 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
     std::atomic<bool> send_closed_{false};
     std::thread recv_thread_;
     std::mutex ssl_mutex_;
+    std::vector<uint8_t> poll_buffer_{std::vector<uint8_t>(64 * 1024)};
     SSL* ssl_{nullptr};
 };
 
@@ -1136,6 +1245,10 @@ class LoadClientController : public ITransportEventHandler {
             auto& state = states_[connection->Id()];
             state.connection = connection;
             state.connected = true;
+            if (pacing_mode_ == PacingMode::PerClientPps && ShouldSendOnConnection(connection->Id())) {
+                state.next_send_time_ns =
+                    InitialPerClientSendTimeNs(connection->Id(), static_cast<double>(NowNs()));
+            }
         }
         std::cerr << ProtocolName(config_.protocol) << " client connection " << connection->Id() << " established" << std::endl;
         if (!paced_) {
@@ -1258,6 +1371,22 @@ class LoadClientController : public ITransportEventHandler {
                        : 1'000'000'000.0 / static_cast<double>(config.send_pps_per_client);
         }
         return 0.0;
+    }
+
+    double InitialPerClientSendTimeNs(uint32_t connection_id, double now_ns) const {
+        if (pacing_mode_ != PacingMode::PerClientPps || active_send_connection_count_ <= 1 || pacing_interval_ns_ <= 0.0) {
+            return now_ns;
+        }
+
+        uint32_t ordinal = 0;
+        for (uint32_t id = 0; id < connection_id; ++id) {
+            if (ShouldSendOnConnection(id)) {
+                ++ordinal;
+            }
+        }
+
+        const double phase_step_ns = pacing_interval_ns_ / static_cast<double>(active_send_connection_count_);
+        return now_ns + (phase_step_ns * static_cast<double>(ordinal % active_send_connection_count_));
     }
 
     bool ShouldSendOnConnection(uint32_t connection_id) const {
@@ -1409,8 +1538,12 @@ class LoadClientController : public ITransportEventHandler {
             }
         }
 
-        for (const auto& frame : sends) {
+        for (auto& frame : sends) {
             try {
+                MessageHeader header{};
+                std::memcpy(&header, frame.data(), sizeof(header));
+                header.send_timestamp_ns = NowNs();
+                std::memcpy(frame.data(), &header, sizeof(header));
                 connection->SendCopy(frame.data(), frame.size());
                 stats_.AddSent(frame.size());
             } catch (const std::exception& ex) {
@@ -1458,6 +1591,9 @@ class SctpServerTransport : public ITransportRunner {
     void Start() override {
         listeners_.reserve(config_.server_count);
         accept_threads_.reserve(config_.server_count);
+        if (config_.sctp_tls) {
+            poll_thread_ = std::thread([this]() { PollLoop(); });
+        }
 
         for (uint32_t i = 0; i < config_.server_count; ++i) {
             const int fd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP);
@@ -1507,6 +1643,10 @@ class SctpServerTransport : public ITransportRunner {
             }
         }
         accept_threads_.clear();
+
+        if (poll_thread_.joinable()) {
+            poll_thread_.join();
+        }
 
         std::vector<std::shared_ptr<SctpConnection>> connections;
         {
@@ -1579,13 +1719,71 @@ class SctpServerTransport : public ITransportRunner {
                     connections_[connection->Id()] = connection;
                 }
                 handler_.OnConnected(connection);
-                connection->StartReceiveLoop();
+                if (connection->UsesExternalPolling()) {
+                    WakePollLoop();
+                } else {
+                    connection->StartReceiveLoop();
+                }
             } catch (const std::exception& ex) {
                 ::close(accepted_fd);
                 handler_.OnTransportError(std::numeric_limits<uint32_t>::max(), ex.what());
             }
         }
     }
+
+    void PollLoop() {
+        while (!stopped_.load(std::memory_order_relaxed) && !g_stop_requested.load(std::memory_order_relaxed)) {
+            std::vector<std::shared_ptr<SctpConnection>> connections;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                for (const auto& [_, connection] : connections_) {
+                    connections.push_back(connection);
+                }
+            }
+
+            if (connections.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
+
+            std::vector<pollfd> pollfds;
+            std::vector<std::shared_ptr<SctpConnection>> polled_connections;
+            pollfds.reserve(connections.size());
+            polled_connections.reserve(connections.size());
+            for (const auto& connection : connections) {
+                const int fd = connection->Fd();
+                if (fd < 0) {
+                    continue;
+                }
+                pollfd pfd{};
+                pfd.fd = fd;
+                pfd.events = POLLIN | POLLERR | POLLHUP;
+                pollfds.push_back(pfd);
+                polled_connections.push_back(connection);
+            }
+
+            const int rc = ::poll(pollfds.data(), pollfds.size(), 5);
+            if (rc < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                handler_.OnTransportError(std::numeric_limits<uint32_t>::max(), SocketErrorString("poll"));
+                return;
+            }
+            if (rc == 0) {
+                continue;
+            }
+
+            for (size_t i = 0; i < pollfds.size(); ++i) {
+                if (pollfds[i].revents == 0) {
+                    continue;
+                }
+                polled_connections[i]->HandlePollEvents(pollfds[i].revents);
+            }
+        }
+    }
+
+    void WakePollLoop() {}
 
     const AppConfig& config_;
     ITransportEventHandler& handler_;
@@ -1595,6 +1793,7 @@ class SctpServerTransport : public ITransportRunner {
     std::map<uint32_t, std::shared_ptr<SctpConnection>> connections_;
     std::vector<int> listeners_;
     std::vector<std::thread> accept_threads_;
+    std::thread poll_thread_;
     SctpTlsContext tls_;
 };
 
@@ -1634,7 +1833,12 @@ class SctpClientTransport : public ITransportRunner {
             auto connection = std::make_shared<SctpConnection>(fd, i, config_.sctp_stream_id, handler_, ssl);
             connections_[connection->Id()] = connection;
             handler_.OnConnected(connection);
-            connection->StartReceiveLoop();
+            if (!connection->UsesExternalPolling()) {
+                connection->StartReceiveLoop();
+            }
+        }
+        if (config_.sctp_tls) {
+            poll_thread_ = std::thread([this]() { PollLoop(); });
         }
     }
 
@@ -1650,12 +1854,69 @@ class SctpClientTransport : public ITransportRunner {
         for (const auto& connection : connections) {
             connection->Close();
         }
+        if (poll_thread_.joinable()) {
+            poll_thread_.join();
+        }
         for (const auto& connection : connections) {
             connection->Join();
         }
     }
 
   private:
+    void PollLoop() {
+        while (!g_stop_requested.load(std::memory_order_relaxed)) {
+            std::vector<std::shared_ptr<SctpConnection>> connections;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (connections_.empty()) {
+                    return;
+                }
+                for (const auto& [_, connection] : connections_) {
+                    connections.push_back(connection);
+                }
+            }
+
+            std::vector<pollfd> pollfds;
+            std::vector<std::shared_ptr<SctpConnection>> polled_connections;
+            pollfds.reserve(connections.size());
+            polled_connections.reserve(connections.size());
+            for (const auto& connection : connections) {
+                const int fd = connection->Fd();
+                if (fd < 0) {
+                    continue;
+                }
+                pollfd pfd{};
+                pfd.fd = fd;
+                pfd.events = POLLIN | POLLERR | POLLHUP;
+                pollfds.push_back(pfd);
+                polled_connections.push_back(connection);
+            }
+            if (pollfds.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
+
+            const int rc = ::poll(pollfds.data(), pollfds.size(), 5);
+            if (rc < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                handler_.OnTransportError(std::numeric_limits<uint32_t>::max(), SocketErrorString("poll"));
+                return;
+            }
+            if (rc == 0) {
+                continue;
+            }
+
+            for (size_t i = 0; i < pollfds.size(); ++i) {
+                if (pollfds[i].revents == 0) {
+                    continue;
+                }
+                polled_connections[i]->HandlePollEvents(pollfds[i].revents);
+            }
+        }
+    }
+
     void ConfigureSocket(int fd) const {
         int nodelay = config_.sctp_nodelay ? 1 : 0;
         if (::setsockopt(fd, IPPROTO_SCTP, SCTP_NODELAY, &nodelay, sizeof(nodelay)) != 0) {
@@ -1682,6 +1943,7 @@ class SctpClientTransport : public ITransportRunner {
     ITransportEventHandler& handler_;
     std::mutex mutex_;
     std::map<uint32_t, std::shared_ptr<SctpConnection>> connections_;
+    std::thread poll_thread_;
     SctpTlsContext tls_;
 };
 
@@ -2460,7 +2722,7 @@ class Client {
             MessageHeader header{};
             header.magic = kMessageMagic;
             header.sequence = stream_ctx.next_sequence++;
-            header.send_timestamp_ns = NowNs();
+            header.send_timestamp_ns = 0;
             std::memcpy(send->storage.data(), &header, sizeof(header));
 
             for (uint32_t i = sizeof(header); i < config_.message_size; ++i) {
@@ -2468,6 +2730,8 @@ class Client {
             }
 
             auto* raw_send = send.release();
+            header.send_timestamp_ns = NowNs();
+            std::memcpy(raw_send->storage.data(), &header, sizeof(header));
             const auto status = api_->StreamSend(stream, &raw_send->quic_buffer, 1, QUIC_SEND_FLAG_NONE, raw_send);
             if (QUIC_FAILED(status)) {
                 delete raw_send;
