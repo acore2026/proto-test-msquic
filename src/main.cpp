@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <fcntl.h>
 #include <limits>
 #include <linux/sctp.h>
 #include <openssl/bio.h>
@@ -680,7 +681,9 @@ class SctpTlsContext {
             throw std::runtime_error(OpenSslErrorString("SSL_CTX_new(DTLS_method)"));
         }
 
-        SSL_CTX_set_mode(ctx_, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+        SSL_CTX_set_mode(
+            ctx_,
+            SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_AUTO_RETRY);
         SSL_CTX_set_read_ahead(ctx_, 1);
 
         if (role_ == Role::Server) {
@@ -799,6 +802,15 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
         if (::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
             throw std::runtime_error(SocketErrorString("setsockopt(SO_RCVTIMEO)"));
         }
+        if (ssl_ != nullptr) {
+            const int flags = ::fcntl(fd, F_GETFL, 0);
+            if (flags < 0) {
+                throw std::runtime_error(SocketErrorString("fcntl(F_GETFL)"));
+            }
+            if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+                throw std::runtime_error(SocketErrorString("fcntl(F_SETFL, O_NONBLOCK)"));
+            }
+        }
     }
 
     ~SctpConnection() override {
@@ -835,10 +847,17 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
         }
 
         if (ssl_ != nullptr) {
+            std::lock_guard<std::mutex> lock(ssl_mutex_);
             size_t offset = 0;
             while (offset < length) {
                 size_t written = 0;
                 if (SSL_write_ex(ssl_, data + offset, length - offset, &written) != 1) {
+                    const int ssl_error = SSL_get_error(ssl_, 0);
+                    if ((ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) &&
+                        !closed_.load(std::memory_order_relaxed)) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        continue;
+                    }
                     throw std::runtime_error(OpenSslErrorString("SSL_write_ex"));
                 }
                 offset += written;
@@ -886,6 +905,7 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
             return;
         }
         if (ssl_ != nullptr) {
+            std::lock_guard<std::mutex> lock(ssl_mutex_);
             SSL_shutdown(ssl_);
         }
         if (::shutdown(fd_, SHUT_WR) != 0 && errno != ENOTCONN && errno != EBADF) {
@@ -909,13 +929,24 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
             ssize_t bytes = -1;
             if (ssl_ != nullptr) {
                 size_t read = 0;
-                const int ok = SSL_read_ex(ssl_, buffer.data(), buffer.size(), &read);
+                int ok = 0;
+                int ssl_error = 0;
+                {
+                    std::lock_guard<std::mutex> lock(ssl_mutex_);
+                    ok = SSL_read_ex(ssl_, buffer.data(), buffer.size(), &read);
+                    if (ok != 1) {
+                        ssl_error = SSL_get_error(ssl_, ok);
+                    }
+                }
                 if (ok == 1) {
                     bytes = static_cast<ssize_t>(read);
                 } else {
-                    const int ssl_error = SSL_get_error(ssl_, ok);
                     if (ssl_error == SSL_ERROR_ZERO_RETURN) {
                         bytes = 0;
+                    } else if ((ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) &&
+                               !closed_.load(std::memory_order_relaxed)) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        continue;
                     } else if (ssl_error == SSL_ERROR_SYSCALL && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                         if (closed_.load(std::memory_order_relaxed)) {
                             break;
@@ -990,6 +1021,7 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
     std::atomic<bool> closed_{false};
     std::atomic<bool> send_closed_{false};
     std::thread recv_thread_;
+    std::mutex ssl_mutex_;
     SSL* ssl_{nullptr};
 };
 
@@ -1285,8 +1317,8 @@ class LoadClientController : public ITransportEventHandler {
                                 if (global_next_send_time_ns_ + (pacing_interval_ns_ * 4.0) < now_ns) {
                                     global_next_send_time_ns_ = now_ns;
                                 }
+                                break;
                             }
-                            break;
                         }
                     } catch (const std::exception& ex) {
                         OnTransportError(id, ex.what());
@@ -1320,14 +1352,7 @@ class LoadClientController : public ITransportEventHandler {
         if (state.next_send_time_ns == 0.0) {
             state.next_send_time_ns = now_ns;
         }
-        if (state.next_send_time_ns > now_ns) {
-            return false;
-        }
-        state.next_send_time_ns += pacing_interval_ns_;
-        if (state.next_send_time_ns + (pacing_interval_ns_ * 4.0) < now_ns) {
-            state.next_send_time_ns = now_ns;
-        }
-        return true;
+        return state.next_send_time_ns <= now_ns;
     }
 
     size_t PumpSends(uint32_t connection_id, size_t max_messages = std::numeric_limits<size_t>::max()) {
@@ -1351,6 +1376,19 @@ class LoadClientController : public ITransportEventHandler {
                    sends.size() < max_messages &&
                    !stop_sending_.load(std::memory_order_relaxed) &&
                    (state.next_sequence - state.echoed_messages) < config_.max_inflight) {
+                if (pacing_mode_ == PacingMode::PerClientPps) {
+                    const double now_ns = static_cast<double>(NowNs());
+                    if (state.next_send_time_ns == 0.0) {
+                        state.next_send_time_ns = now_ns;
+                    }
+                    if (state.next_send_time_ns > now_ns) {
+                        break;
+                    }
+                    state.next_send_time_ns += pacing_interval_ns_;
+                    if (state.next_send_time_ns + (pacing_interval_ns_ * 4.0) < now_ns) {
+                        state.next_send_time_ns = now_ns;
+                    }
+                }
                 std::vector<uint8_t> frame(config_.message_size);
                 MessageHeader header{};
                 header.magic = kMessageMagic;
@@ -2334,13 +2372,33 @@ class Client {
 
     void PacerLoop() {
         while (!pacer_stop_.load(std::memory_order_relaxed) && !g_stop_requested.load(std::memory_order_relaxed)) {
+            bool did_work = false;
+            double earliest_next_send_ns = std::numeric_limits<double>::max();
             for (auto& connection : connections_) {
                 std::lock_guard<std::mutex> lock(connection->mutex);
                 if (connection->stream_ctx != nullptr && connection->stream != nullptr) {
-                    PumpSends(*connection, connection->stream, *connection->stream_ctx);
+                    if (PumpSends(*connection, connection->stream, *connection->stream_ctx) > 0) {
+                        did_work = true;
+                    }
+                    std::lock_guard<std::mutex> stream_lock(connection->stream_ctx->mutex);
+                    if (connection->stream_ctx->stream_started &&
+                        !connection->stream_ctx->shutdown_started &&
+                        connection->stream_ctx->next_send_time_ns > 0.0) {
+                        earliest_next_send_ns = std::min(earliest_next_send_ns, connection->stream_ctx->next_send_time_ns);
+                    }
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (did_work || earliest_next_send_ns == std::numeric_limits<double>::max()) {
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                continue;
+            }
+
+            const double now_ns = static_cast<double>(NowNs());
+            if (earliest_next_send_ns <= now_ns) {
+                continue;
+            }
+            const auto sleep_ns = static_cast<int64_t>(std::min(earliest_next_send_ns - now_ns, 1'000'000.0));
+            std::this_thread::sleep_for(std::chrono::nanoseconds(std::max<int64_t>(sleep_ns, 50'000)));
         }
     }
 
@@ -2371,12 +2429,13 @@ class Client {
         }
     }
 
-    void PumpSends(ConnectionContext& connection, HQUIC stream, StreamContext& stream_ctx) {
+    size_t PumpSends(ConnectionContext& connection, HQUIC stream, StreamContext& stream_ctx) {
         std::lock_guard<std::mutex> lock(stream_ctx.mutex);
         if (!stream_ctx.stream_started || stream_ctx.shutdown_started) {
-            return;
+            return 0;
         }
 
+        size_t send_count = 0;
         while (ShouldSendOnConnection(connection) &&
                !stop_sending_.load(std::memory_order_relaxed) &&
                (stream_ctx.next_sequence - stream_ctx.echoed_messages) < config_.max_inflight) {
@@ -2414,9 +2473,10 @@ class Client {
                 delete raw_send;
                 std::cerr << "StreamSend failed: " << StatusToHex(status) << std::endl;
                 api_->ConnectionShutdown(connection.connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 1);
-                return;
+                return send_count;
             }
             stats_.AddSent(config_.message_size);
+            ++send_count;
         }
 
         if (stop_sending_.load(std::memory_order_relaxed) &&
@@ -2425,6 +2485,7 @@ class Client {
             stream_ctx.shutdown_started = true;
             api_->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
         }
+        return send_count;
     }
 
     void RequestStopSending(ConnectionContext& connection) {
