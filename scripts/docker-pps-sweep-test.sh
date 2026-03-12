@@ -16,6 +16,9 @@ PPS_MODE="${PPS_MODE:-total}"
 PROTOCOLS="${PROTOCOLS:-msquic sctp}"
 DOCKER_BIN="${DOCKER_BIN:-$(command -v docker 2>/dev/null || true)}"
 CPU_SAMPLE_INTERVAL_SEC="${CPU_SAMPLE_INTERVAL_SEC:-0.5}"
+CPU_SAMPLE_ACTIVE_FLOOR_RATIO="${CPU_SAMPLE_ACTIVE_FLOOR_RATIO:-0.10}"
+CPU_SAMPLE_ACTIVE_FLOOR_MIN_PCT="${CPU_SAMPLE_ACTIVE_FLOOR_MIN_PCT:-0.50}"
+CPU_SAMPLE_MIN_ACTIVE_SAMPLES="${CPU_SAMPLE_MIN_ACTIVE_SAMPLES:-5}"
 NOFILE_ULIMIT="${NOFILE_ULIMIT:-40960:40960}"
 
 if [[ -z "${DOCKER_BIN}" ]]; then
@@ -200,9 +203,36 @@ cpu_stats_for_container() {
     return 0
   fi
 
-  local p50_index=$(( (50 * count + 99) / 100 - 1 ))
-  local p99_index=$(( (99 * count + 99) / 100 - 1 ))
-  printf '%.2f,%.2f' "${samples[${p50_index}]}" "${samples[${p99_index}]}"
+  local peak="${samples[$((count - 1))]}"
+  local active_floor
+  active_floor="$(
+    awk -v peak="${peak}" -v ratio="${CPU_SAMPLE_ACTIVE_FLOOR_RATIO}" -v min_pct="${CPU_SAMPLE_ACTIVE_FLOOR_MIN_PCT}" '
+      BEGIN {
+        floor = peak * ratio;
+        if (floor < min_pct) {
+          floor = min_pct;
+        }
+        printf "%.2f", floor;
+      }
+    '
+  )"
+
+  mapfile -t active_samples < <(
+    awk -F, -v container="${container}" -v floor="${active_floor}" '
+      $1 == container && ($2 + 0) >= floor { print $2 }
+    ' "${file}" | sort -n
+  )
+
+  local result_samples=("${samples[@]}")
+  local result_count="${count}"
+  if [[ "${#active_samples[@]}" -ge "${CPU_SAMPLE_MIN_ACTIVE_SAMPLES}" ]]; then
+    result_samples=("${active_samples[@]}")
+    result_count="${#active_samples[@]}"
+  fi
+
+  local p50_index=$(( (50 * result_count + 99) / 100 - 1 ))
+  local p99_index=$(( (99 * result_count + 99) / 100 - 1 ))
+  printf '%.2f,%.2f' "${result_samples[${p50_index}]}" "${result_samples[${p99_index}]}"
 }
 
 echo "protocol,pps_mode,pps_value,sent_messages,echoed_messages,sent_bytes,echoed_bytes,latency_p50_ms,latency_p75_ms,latency_p99_ms,server_cpu_p50_pct,server_cpu_p99_pct,client_cpu_p50_pct,client_cpu_p99_pct"
