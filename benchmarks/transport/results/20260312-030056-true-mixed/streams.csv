@@ -1,0 +1,7 @@
+protocol,base_port,stream_name,stream_id,sent_messages,echoed_messages,sent_bytes,echoed_bytes,latency_p50_ms,latency_p75_ms,latency_p99_ms
+msquic,28649,control,0,100,100,6400,6400,8.042,9.684,12.214
+msquic,28649,media-0,1,13308,13308,54509568,54509568,4.609,5.363,8.646
+msquic,28649,media-1,2,13313,13313,54530048,54530048,4.594,5.348,8.621
+sctp,28749,control,0,15,15,960,960,2.165,5.009,6.869
+sctp,28749,media-0,1,1801,1801,7376896,7376896,2.220,3.121,1008.111
+sctp,28749,media-1,2,1799,1799,7368704,7368704,2.217,3.082,1008.181

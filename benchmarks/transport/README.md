@@ -30,6 +30,21 @@ summary fields:
 - runs backpressure first
 - then runs congestion with the same results directory
 
+`run-mixed-workload.sh`
+- approximates one tiny critical flow plus multiple large media flows
+- reports control and media client summaries side by side
+- useful for checking whether bulk traffic destroys control latency
+
+`find-mixed-threshold.sh`
+- automates the mixed-workload search
+- sweeps media client count and media in-flight depth
+- records where each protocol still returns a usable result
+
+`run-true-mixed-benchmark.sh`
+- runs a real shared-session comparison using `--stream-profile`
+- compares `msquic` and plain `sctp`
+- writes aggregate and per-stream CSVs
+
 ## Ready-To-Use Commands
 
 Run the backpressure matrix:
@@ -48,6 +63,24 @@ Run both:
 
 ```bash
 sudo NETEM_IFACE=eth0 ./benchmarks/transport/run-all.sh
+```
+
+Run the mixed control-plus-media approximation:
+
+```bash
+./benchmarks/transport/run-mixed-workload.sh
+```
+
+Run the automated threshold search:
+
+```bash
+./benchmarks/transport/find-mixed-threshold.sh
+```
+
+Run the real shared-session mixed benchmark:
+
+```bash
+./benchmarks/transport/run-true-mixed-benchmark.sh
 ```
 
 ## Useful Overrides
@@ -72,6 +105,38 @@ NETEM_LOSS_VALUES="0% 0.1% 0.5% 1%" \
 ./benchmarks/transport/run-congestion-netem.sh
 ```
 
+Tune the mixed workload:
+
+```bash
+CONTROL_MESSAGE_SIZE=64 \
+CONTROL_SEND_PPS_PER_CLIENT=20 \
+MEDIA_CLIENTS=8 \
+MEDIA_MESSAGE_SIZE=16384 \
+MEDIA_MAX_INFLIGHT=64 \
+MEDIA_SEND_PPS_PER_CLIENT=0 \
+./benchmarks/transport/run-mixed-workload.sh
+```
+
+Tune the automated search:
+
+```bash
+SEARCH_PROTOCOLS="msquic sctp" \
+SEARCH_MEDIA_CLIENTS="2 4 8 16" \
+SEARCH_MEDIA_MAX_INFLIGHTS="4 8 16 24 28 32 64 128 256" \
+CONTROL_COMPLETION_MIN=1.0 \
+MEDIA_COMPLETION_MIN=0.99 \
+./benchmarks/transport/find-mixed-threshold.sh
+```
+
+Tune the real shared-session benchmark:
+
+```bash
+STREAM_PROFILE='control:64:20:1,media:4096:0:16:2' \
+CLIENTS=1 \
+DURATION_SEC=5 \
+./benchmarks/transport/run-true-mixed-benchmark.sh
+```
+
 ## Current Limit
 
 This is a transport-level first pass, not a full stream-level flow-control
@@ -85,6 +150,13 @@ SCTP stream id per connection, so the results mostly compare:
 They do not yet isolate per-stream flow-control behavior across multiple
 independent streams.
 
+`run-mixed-workload.sh` is therefore an approximation of:
+
+- one critical low-rate control stream
+- multiple bulk media streams
+
+using separate client groups that share the same server and transport path.
+
 ## Output Layout
 
 Each run writes under:
@@ -97,3 +169,7 @@ Files:
 
 - `metadata.env`
 - `backpressure-matrix.csv` or `congestion-netem.csv`
+- `mixed-threshold-search.csv`
+- `mixed-threshold-best.csv`
+- `overall.csv`
+- `streams.csv`

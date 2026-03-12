@@ -45,6 +45,11 @@ This bundle therefore defaults to:
 - fixed total offered load sweeps
 - intended to find the overload knee and completion collapse point
 
+`run-server-count-comparison.sh`
+- fixed 128-client comparison for uneven server-count layouts
+- intended to compare `3` vs `10` servers at `50 PPS/client`
+- repeats runs and summarizes CPU plus latency tail-spread deltas
+
 `run-all.sh`
 - runs all three scenarios into one timestamped directory
 - generates `REPORT.md`
@@ -78,6 +83,12 @@ Run only the throughput sweep:
 ./benchmarks/n2/run-throughput-sweep.sh
 ```
 
+Run the 128-client server-count comparison:
+
+```bash
+./benchmarks/n2/run-server-count-comparison.sh
+```
+
 ## Useful Overrides
 
 Use a different image:
@@ -100,6 +111,16 @@ Tune the scaling workload:
 SCALING_CLIENT_COUNTS="32 64 128 256 512" \
 SCALING_PPS_PER_CLIENT=25 \
 ./benchmarks/n2/run-scaling-matrix.sh
+```
+
+Tune the server-count comparison:
+
+```bash
+COMPARE_CLIENTS=128 \
+COMPARE_SERVER_COUNTS="3 10" \
+COMPARE_PPS_PER_CLIENT=50 \
+COMPARE_RUNS=7 \
+./benchmarks/n2/run-server-count-comparison.sh
 ```
 
 Tune the throughput sweep:
@@ -135,7 +156,16 @@ The bundle contains:
 - `latency-matrix.csv`
 - `scaling-matrix.csv`
 - `throughput-sweep.csv`
+- `server-count-comparison-raw.csv`
+- `server-count-comparison-summary.csv`
+- `server-count-comparison-delta.csv`
 - `REPORT.md`
+
+The dedicated server-count comparison also writes a small `README.md` into its
+result bundle describing the workload and the latency variance proxies it uses:
+
+- `latency_variance_proxy_avg_ms = p99 - p50`
+- `latency_tail_ratio_avg = p99 / p50`
 
 ## Report Guidance
 

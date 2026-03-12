@@ -1,0 +1,3 @@
+protocol,base_port,clients,server_count,duration_sec,drain_timeout_ms,stream_profile,sent_messages,echoed_messages,sent_bytes,echoed_bytes,latency_p50_ms,latency_p75_ms,latency_p99_ms
+msquic,28649,1,1,5,2000,"control:64:20:1,media:4096:0:16:2",26721,26721,109046016,109046016,4.608,5.364,8.694
+sctp,28749,1,1,5,2000,"control:64:20:1,media:4096:0:16:2",3615,3615,14746560,14746560,2.219,3.091,1008.178

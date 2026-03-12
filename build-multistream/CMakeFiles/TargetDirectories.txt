@@ -1,0 +1,3 @@
+/home/administrator/msquic-test/build-multistream/CMakeFiles/msquic-loadtest.dir
+/home/administrator/msquic-test/build-multistream/CMakeFiles/edit_cache.dir
+/home/administrator/msquic-test/build-multistream/CMakeFiles/rebuild_cache.dir

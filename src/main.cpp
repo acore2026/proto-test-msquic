@@ -2,9 +2,12 @@
 
 #include <arpa/inet.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
+#include <deque>
 #include <csignal>
 #include <cerrno>
 #include <cstdint>
@@ -246,6 +249,7 @@ void PrintUsage() {
         << "  --protocol=msquic|sctp    Transport protocol, default msquic\n"
         << "  --base-port=PORT           First port, default 15443\n"
         << "  --server-count=N           Number of listeners, default 1\n"
+        << "  --stream-count=N           Streams per connection/association, default 1\n"
         << "  --message-size=BYTES       Fixed frame size, default 1024\n"
         << "  --idle-timeout-ms=N        Idle timeout, default 30000\n"
         << "  --stats-interval-ms=N      Stats interval, default 1000\n\n"
@@ -258,6 +262,7 @@ void PrintUsage() {
         << "  --sctp-nodelay=1           Disable SCTP Nagle-like bundling, default enabled\n"
         << "  --sctp-stream-id=N         SCTP stream id, default 0\n"
         << "  --sctp-tls=1               Enable DTLS-over-SCTP, default disabled\n"
+        << "  --stream-profile=SPEC      Per-stream profiles name:size:pps:max_inflight[:count]\n"
         << "  --ca=FILE                  CA bundle for peer verification\n\n"
         << "Client options:\n"
         << "  --target=HOST              Server name or IP\n"
@@ -273,15 +278,24 @@ void PrintUsage() {
         << "  --sctp-nodelay=1           Disable SCTP Nagle-like bundling, default enabled\n"
         << "  --sctp-stream-id=N         SCTP stream id, default 0\n"
         << "  --sctp-tls=1               Enable DTLS-over-SCTP, default disabled\n"
+        << "  --stream-profile=SPEC      Per-stream profiles name:size:pps:max_inflight[:count]\n"
         << "  --ca=FILE                  CA bundle for peer verification\n";
 }
 
 struct AppConfig {
+    struct StreamProfile {
+        std::string name;
+        uint32_t message_size{1024};
+        uint32_t max_inflight{64};
+        uint64_t send_pps{0};
+    };
+
     std::string mode;
     Protocol protocol{Protocol::MsQuic};
     std::string alpn{kDefaultAlpn};
     uint16_t base_port{15443};
     uint32_t server_count{1};
+    uint32_t stream_count{1};
     uint32_t message_size{1024};
     uint64_t idle_timeout_ms{30000};
     uint64_t stats_interval_ms{1000};
@@ -304,7 +318,66 @@ struct AppConfig {
     uint16_t sctp_stream_id{0};
     bool sctp_tls{false};
     std::string ca_file;
+    std::vector<StreamProfile> stream_profiles;
 };
+
+bool HasStreamProfilePacing(const AppConfig& config) {
+    for (const auto& profile : config.stream_profiles) {
+        if (profile.send_pps > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<std::string> SplitString(const std::string& input, char delimiter) {
+    std::vector<std::string> parts;
+    std::stringstream stream(input);
+    std::string part;
+    while (std::getline(stream, part, delimiter)) {
+        parts.push_back(part);
+    }
+    return parts;
+}
+
+std::vector<AppConfig::StreamProfile> ParseStreamProfiles(const std::string& value) {
+    std::vector<AppConfig::StreamProfile> profiles;
+    for (const auto& raw_entry : SplitString(value, ',')) {
+        if (raw_entry.empty()) {
+            continue;
+        }
+        const auto fields = SplitString(raw_entry, ':');
+        if (fields.size() < 4 || fields.size() > 5) {
+            throw std::runtime_error(
+                "invalid --stream-profile entry '" + raw_entry +
+                "' (expected name:message_size:send_pps:max_inflight[:count])");
+        }
+        const std::string& name = fields[0];
+        const uint32_t message_size = ParseNumber<uint32_t>(fields[1], "stream-profile message_size");
+        const uint64_t send_pps = ParseNumber<uint64_t>(fields[2], "stream-profile send_pps");
+        const uint32_t max_inflight = ParseNumber<uint32_t>(fields[3], "stream-profile max_inflight");
+        const uint32_t count =
+            fields.size() == 5 ? ParseNumber<uint32_t>(fields[4], "stream-profile count") : 1;
+        if (message_size < 24) {
+            throw std::runtime_error("stream-profile message_size must be at least 24 bytes");
+        }
+        if (max_inflight == 0) {
+            throw std::runtime_error("stream-profile max_inflight must be >= 1");
+        }
+        if (count == 0) {
+            throw std::runtime_error("stream-profile count must be >= 1");
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            profiles.push_back(AppConfig::StreamProfile{
+                count == 1 ? name : name + "-" + std::to_string(i),
+                message_size,
+                max_inflight,
+                send_pps,
+            });
+        }
+    }
+    return profiles;
+}
 
 AppConfig LoadConfig(const Args& args) {
     AppConfig config;
@@ -313,6 +386,7 @@ AppConfig LoadConfig(const Args& args) {
     config.alpn = GetString(args, "alpn", kDefaultAlpn);
     config.base_port = GetNumber<uint16_t>(args, "base-port", 15443);
     config.server_count = GetNumber<uint32_t>(args, "server-count", 1);
+    config.stream_count = GetNumber<uint32_t>(args, "stream-count", 1);
     config.message_size = GetNumber<uint32_t>(args, "message-size", 1024);
     config.idle_timeout_ms = GetNumber<uint64_t>(args, "idle-timeout-ms", 30000);
     config.stats_interval_ms = GetNumber<uint64_t>(args, "stats-interval-ms", 1000);
@@ -320,12 +394,23 @@ AppConfig LoadConfig(const Args& args) {
     config.sctp_stream_id = GetNumber<uint16_t>(args, "sctp-stream-id", 0);
     config.sctp_tls = GetBool(args, "sctp-tls", false);
     config.ca_file = GetString(args, "ca", "");
+    const auto stream_profile_arg = FindArg(args, "stream-profile");
+    if (stream_profile_arg.has_value()) {
+        config.stream_profiles = ParseStreamProfiles(*stream_profile_arg);
+        config.stream_count = static_cast<uint32_t>(config.stream_profiles.size());
+    }
 
     if (config.message_size < 24) {
         throw std::runtime_error("--message-size must be at least 24 bytes");
     }
     if (config.server_count == 0) {
         throw std::runtime_error("--server-count must be >= 1");
+    }
+    if (config.stream_count == 0) {
+        throw std::runtime_error("--stream-count must be >= 1");
+    }
+    if (config.protocol == Protocol::Sctp && config.sctp_tls && config.stream_count > 1) {
+        throw std::runtime_error("SCTP multi-stream is not supported with --sctp-tls=1 yet");
     }
 
     if (config.mode == "server") {
@@ -364,6 +449,9 @@ AppConfig LoadConfig(const Args& args) {
         if (config.send_pps > 0 && config.send_pps_per_client > 0) {
             throw std::runtime_error("use only one of --send-pps or --send-pps-per-client");
         }
+        if (!config.stream_profiles.empty() && (config.send_pps > 0 || config.send_pps_per_client > 0)) {
+            throw std::runtime_error("use --stream-profile send rates instead of --send-pps/--send-pps-per-client");
+        }
     } else {
         throw std::runtime_error("mode must be 'server' or 'client'");
     }
@@ -399,6 +487,48 @@ struct MessageHeader {
 
 static_assert(sizeof(MessageHeader) == 24, "Unexpected wire header size");
 
+uint32_t FrameSizeFromHeader(const MessageHeader& header, uint32_t fallback_size) {
+    if (header.reserved >= sizeof(MessageHeader)) {
+        return header.reserved;
+    }
+    return fallback_size;
+}
+
+std::optional<uint32_t> TryPeekFrameSize(const std::vector<uint8_t>& buffer, uint32_t fallback_size) {
+    if (buffer.size() < sizeof(MessageHeader)) {
+        return std::nullopt;
+    }
+    MessageHeader header{};
+    std::memcpy(&header, buffer.data(), sizeof(header));
+    if (header.magic != kMessageMagic) {
+        throw std::runtime_error("invalid frame magic");
+    }
+    const uint32_t frame_size = FrameSizeFromHeader(header, fallback_size);
+    if (frame_size < sizeof(MessageHeader)) {
+        throw std::runtime_error("invalid frame size");
+    }
+    if (buffer.size() < frame_size) {
+        return std::nullopt;
+    }
+    return frame_size;
+}
+
+AppConfig::StreamProfile DefaultStreamProfile(const AppConfig& config) {
+    return AppConfig::StreamProfile{
+        "default",
+        config.message_size,
+        config.max_inflight,
+        config.send_pps_per_client,
+    };
+}
+
+AppConfig::StreamProfile StreamProfileForOrdinal(const AppConfig& config, uint32_t ordinal) {
+    if (config.stream_profiles.empty()) {
+        return DefaultStreamProfile(config);
+    }
+    return config.stream_profiles.at(ordinal);
+}
+
 struct SendBuffer {
     QUIC_BUFFER quic_buffer{};
     std::vector<uint8_t> storage;
@@ -415,6 +545,19 @@ class Stats {
         uint64_t p50_ns{std::numeric_limits<uint64_t>::max()};
         uint64_t p75_ns{std::numeric_limits<uint64_t>::max()};
         uint64_t p99_ns{std::numeric_limits<uint64_t>::max()};
+    };
+
+    struct LatencyDetailSnapshot {
+        size_t count{0};
+        uint64_t min_ns{std::numeric_limits<uint64_t>::max()};
+        uint64_t max_ns{std::numeric_limits<uint64_t>::max()};
+        uint64_t p90_ns{std::numeric_limits<uint64_t>::max()};
+        uint64_t p95_ns{std::numeric_limits<uint64_t>::max()};
+        uint64_t p99_ns{std::numeric_limits<uint64_t>::max()};
+        uint64_t p999_ns{std::numeric_limits<uint64_t>::max()};
+        double mean_ns{0.0};
+        double stddev_ns{0.0};
+        std::array<uint64_t, 7> bucket_counts{};
     };
 
     void AddSent(uint64_t bytes) {
@@ -487,6 +630,92 @@ class Stats {
     std::vector<uint64_t> latency_samples_;
 };
 
+struct StreamMetricSnapshot {
+    uint64_t sent_messages{0};
+    uint64_t echoed_messages{0};
+    uint64_t sent_bytes{0};
+    uint64_t echoed_bytes{0};
+    Stats::LatencySnapshot latency;
+    Stats::LatencyDetailSnapshot latency_detail;
+};
+
+class StreamMetrics {
+  public:
+    void AddSent(uint64_t bytes) {
+        sent_bytes_ += bytes;
+        sent_messages_ += 1;
+    }
+
+    void AddReceived(uint64_t bytes, uint64_t latency_ns) {
+        echoed_bytes_ += bytes;
+        echoed_messages_ += 1;
+        latency_samples_.push_back(latency_ns);
+    }
+
+    StreamMetricSnapshot Snapshot() const {
+        StreamMetricSnapshot snapshot;
+        snapshot.sent_messages = sent_messages_;
+        snapshot.echoed_messages = echoed_messages_;
+        snapshot.sent_bytes = sent_bytes_;
+        snapshot.echoed_bytes = echoed_bytes_;
+        if (!latency_samples_.empty()) {
+            auto samples = latency_samples_;
+            std::sort(samples.begin(), samples.end());
+            snapshot.latency.p50_ns = PercentileValue(samples, 0.50);
+            snapshot.latency.p75_ns = PercentileValue(samples, 0.75);
+            snapshot.latency.p99_ns = PercentileValue(samples, 0.99);
+            snapshot.latency_detail.count = samples.size();
+            snapshot.latency_detail.min_ns = samples.front();
+            snapshot.latency_detail.max_ns = samples.back();
+            snapshot.latency_detail.p90_ns = PercentileValue(samples, 0.90);
+            snapshot.latency_detail.p95_ns = PercentileValue(samples, 0.95);
+            snapshot.latency_detail.p99_ns = PercentileValue(samples, 0.99);
+            snapshot.latency_detail.p999_ns = PercentileValue(samples, 0.999);
+            double sum = 0.0;
+            for (uint64_t sample : samples) {
+                sum += static_cast<double>(sample);
+                const double ms = static_cast<double>(sample) / 1'000'000.0;
+                if (ms <= 0.5) {
+                    snapshot.latency_detail.bucket_counts[0] += 1;
+                } else if (ms <= 1.0) {
+                    snapshot.latency_detail.bucket_counts[1] += 1;
+                } else if (ms <= 2.0) {
+                    snapshot.latency_detail.bucket_counts[2] += 1;
+                } else if (ms <= 5.0) {
+                    snapshot.latency_detail.bucket_counts[3] += 1;
+                } else if (ms <= 10.0) {
+                    snapshot.latency_detail.bucket_counts[4] += 1;
+                } else if (ms <= 50.0) {
+                    snapshot.latency_detail.bucket_counts[5] += 1;
+                } else {
+                    snapshot.latency_detail.bucket_counts[6] += 1;
+                }
+            }
+            snapshot.latency_detail.mean_ns = sum / static_cast<double>(samples.size());
+            double variance_sum = 0.0;
+            for (uint64_t sample : samples) {
+                const double delta = static_cast<double>(sample) - snapshot.latency_detail.mean_ns;
+                variance_sum += delta * delta;
+            }
+            snapshot.latency_detail.stddev_ns = std::sqrt(variance_sum / static_cast<double>(samples.size()));
+        }
+        return snapshot;
+    }
+
+  private:
+    static uint64_t PercentileValue(const std::vector<uint64_t>& sorted, double percentile) {
+        const double scaled = percentile * static_cast<double>(sorted.size() - 1);
+        const size_t index = static_cast<size_t>(scaled + 0.5);
+        return sorted[std::min(index, sorted.size() - 1)];
+    }
+
+    uint64_t sent_messages_{0};
+    uint64_t echoed_messages_{0};
+    uint64_t sent_bytes_{0};
+    uint64_t echoed_bytes_{0};
+    std::vector<uint64_t> latency_samples_;
+};
+
 std::string FormatRateMbps(uint64_t bytes, double seconds) {
     if (seconds <= 0.0) {
         return "0.00";
@@ -494,6 +723,12 @@ std::string FormatRateMbps(uint64_t bytes, double seconds) {
     const double mbps = (static_cast<double>(bytes) * 8.0) / seconds / 1'000'000.0;
     std::ostringstream stream;
     stream << std::fixed << std::setprecision(2) << mbps;
+    return stream.str();
+}
+
+std::string FormatDouble(double value, int precision) {
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(precision) << value;
     return stream.str();
 }
 
@@ -512,6 +747,28 @@ std::string FormatLatencySummary(const Stats::LatencySnapshot& latency) {
     stream << FormatLatencyMs(latency.p50_ns) << "/"
            << FormatLatencyMs(latency.p75_ns) << "/"
            << FormatLatencyMs(latency.p99_ns);
+    return stream.str();
+}
+
+std::string FormatLatencyDetailSummary(const Stats::LatencyDetailSnapshot& latency) {
+    std::ostringstream stream;
+    stream << "count=" << latency.count
+           << " mean_ms=" << FormatDouble(latency.mean_ns / 1'000'000.0, 3)
+           << " stddev_ms=" << FormatDouble(latency.stddev_ns / 1'000'000.0, 3)
+           << " min_ms=" << FormatLatencyMs(latency.min_ns)
+           << " p90_ms=" << FormatLatencyMs(latency.p90_ns)
+           << " p95_ms=" << FormatLatencyMs(latency.p95_ns)
+           << " p99_ms=" << FormatLatencyMs(latency.p99_ns)
+           << " p999_ms=" << FormatLatencyMs(latency.p999_ns)
+           << " max_ms=" << FormatLatencyMs(latency.max_ns)
+           << " buckets_ms[<=0.5,<=1,<=2,<=5,<=10,<=50,>50]="
+           << latency.bucket_counts[0] << ","
+           << latency.bucket_counts[1] << ","
+           << latency.bucket_counts[2] << ","
+           << latency.bucket_counts[3] << ","
+           << latency.bucket_counts[4] << ","
+           << latency.bucket_counts[5] << ","
+           << latency.bucket_counts[6];
     return stream.str();
 }
 
@@ -630,7 +887,7 @@ class ITransportConnection {
   public:
     virtual ~ITransportConnection() = default;
     virtual uint32_t Id() const = 0;
-    virtual void SendCopy(const uint8_t* data, size_t length) = 0;
+    virtual void SendCopy(const uint8_t* data, size_t length, uint16_t stream_id) = 0;
     virtual void CloseSend() = 0;
     virtual void Close() = 0;
 };
@@ -639,7 +896,11 @@ class ITransportEventHandler {
   public:
     virtual ~ITransportEventHandler() = default;
     virtual void OnConnected(const std::shared_ptr<ITransportConnection>& connection) = 0;
-    virtual void OnData(const std::shared_ptr<ITransportConnection>& connection, const uint8_t* data, size_t length) = 0;
+    virtual void OnData(
+        const std::shared_ptr<ITransportConnection>& connection,
+        uint16_t stream_id,
+        const uint8_t* data,
+        size_t length) = 0;
     virtual void OnPeerClosed(const std::shared_ptr<ITransportConnection>& connection) = 0;
     virtual void OnClosed(uint32_t connection_id) = 0;
     virtual void OnTransportError(uint32_t connection_id, const std::string& message) = 0;
@@ -795,22 +1056,18 @@ class SctpTlsContext {
 
 class SctpConnection : public ITransportConnection, public std::enable_shared_from_this<SctpConnection> {
   public:
-    SctpConnection(int fd, uint32_t id, uint16_t stream_id, ITransportEventHandler& handler, SSL* ssl)
-        : fd_(fd), id_(id), stream_id_(stream_id), handler_(handler), ssl_(ssl) {
+    struct PendingSend {
+        uint16_t stream_id;
+        std::vector<uint8_t> data;
+    };
+
+    SctpConnection(int fd, uint32_t id, uint16_t default_stream_id, ITransportEventHandler& handler, SSL* ssl)
+        : fd_(fd), id_(id), default_stream_id_(default_stream_id), handler_(handler), ssl_(ssl) {
         timeval timeout{};
         timeout.tv_sec = 0;
         timeout.tv_usec = 200000;
         if (::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0) {
             throw std::runtime_error(SocketErrorString("setsockopt(SO_RCVTIMEO)"));
-        }
-        if (ssl_ != nullptr) {
-            const int flags = ::fcntl(fd, F_GETFL, 0);
-            if (flags < 0) {
-                throw std::runtime_error(SocketErrorString("fcntl(F_GETFL)"));
-            }
-            if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
-                throw std::runtime_error(SocketErrorString("fcntl(F_SETFL, O_NONBLOCK)"));
-            }
         }
     }
 
@@ -833,6 +1090,9 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
     }
 
     void StartReceiveLoop() {
+        if (ssl_ == nullptr) {
+            send_thread_ = std::thread([self = shared_from_this()]() { self->SendLoop(); });
+        }
         recv_thread_ = std::thread([self = shared_from_this()]() { self->ReceiveLoop(); });
     }
 
@@ -868,7 +1128,7 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
 
             if (ok == 1) {
                 try {
-                    handler_.OnData(shared_from_this(), poll_buffer_.data(), read);
+                    handler_.OnData(shared_from_this(), default_stream_id_, poll_buffer_.data(), read);
                 } catch (const std::exception& ex) {
                     handler_.OnTransportError(id_, ex.what());
                     Close();
@@ -908,9 +1168,12 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
         if (recv_thread_.joinable()) {
             recv_thread_.join();
         }
+        if (send_thread_.joinable()) {
+            send_thread_.join();
+        }
     }
 
-    void SendCopy(const uint8_t* data, size_t length) override {
+    void SendCopy(const uint8_t* data, size_t length, uint16_t stream_id) override {
         if (closed_.load(std::memory_order_relaxed)) {
             return;
         }
@@ -948,6 +1211,94 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
             return;
         }
 
+        {
+            std::lock_guard<std::mutex> lock(send_mutex_);
+            pending_sends_.push_back(PendingSend{stream_id, std::vector<uint8_t>(data, data + length)});
+        }
+        send_cv_.notify_one();
+    }
+
+    void CloseSend() override {
+        bool expected = false;
+        if (!send_closed_.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+            return;
+        }
+        if (fd_.load(std::memory_order_relaxed) < 0) {
+            return;
+        }
+        if (ssl_ != nullptr) {
+            std::lock_guard<std::mutex> lock(ssl_mutex_);
+            SSL_shutdown(ssl_);
+        }
+        if (ssl_ == nullptr) {
+            send_close_requested_.store(true, std::memory_order_relaxed);
+            send_cv_.notify_one();
+            return;
+        }
+        if (::shutdown(fd_, SHUT_WR) != 0 && errno != ENOTCONN && errno != EBADF) {
+            throw std::runtime_error(SocketErrorString("shutdown(SHUT_WR)"));
+        }
+    }
+
+    void Close() override {
+        if (closed_.exchange(true, std::memory_order_relaxed)) {
+            return;
+        }
+        send_cv_.notify_all();
+        ::shutdown(fd_, SHUT_RDWR);
+        CloseFd();
+    }
+
+  private:
+    void SendLoop() {
+        while (!closed_.load(std::memory_order_relaxed) && !g_stop_requested.load(std::memory_order_relaxed)) {
+            PendingSend pending{};
+            bool have_pending = false;
+            bool should_close_send = false;
+
+            {
+                std::unique_lock<std::mutex> lock(send_mutex_);
+                send_cv_.wait(lock, [&]() {
+                    return closed_.load(std::memory_order_relaxed) ||
+                           !pending_sends_.empty() ||
+                           send_close_requested_.load(std::memory_order_relaxed);
+                });
+                if (closed_.load(std::memory_order_relaxed)) {
+                    return;
+                }
+                if (!pending_sends_.empty()) {
+                    pending = std::move(pending_sends_.front());
+                    pending_sends_.pop_front();
+                    have_pending = true;
+                } else if (send_close_requested_.load(std::memory_order_relaxed)) {
+                    should_close_send = true;
+                }
+            }
+
+            if (have_pending) {
+                try {
+                    SendBlocking(pending.data.data(), pending.data.size(), pending.stream_id);
+                } catch (const std::exception& ex) {
+                    handler_.OnTransportError(id_, ex.what());
+                    Close();
+                    handler_.OnClosed(id_);
+                    return;
+                }
+                continue;
+            }
+
+            if (should_close_send) {
+                if (::shutdown(fd_, SHUT_WR) != 0 && errno != ENOTCONN && errno != EBADF) {
+                    handler_.OnTransportError(id_, SocketErrorString("shutdown(SHUT_WR)"));
+                    Close();
+                    handler_.OnClosed(id_);
+                }
+                return;
+            }
+        }
+    }
+
+    void SendBlocking(const uint8_t* data, size_t length, uint16_t stream_id) {
         size_t offset = 0;
         while (offset < length) {
             struct msghdr msg {};
@@ -968,43 +1319,20 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
 
             auto* sndinfo = reinterpret_cast<sctp_sndinfo*>(CMSG_DATA(cmsg));
             std::memset(sndinfo, 0, sizeof(*sndinfo));
-            sndinfo->snd_sid = stream_id_;
+            sndinfo->snd_sid = stream_id;
             msg.msg_controllen = cmsg->cmsg_len;
 
             const ssize_t written = sendmsg(fd_, &msg, 0);
             if (written < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
                 throw std::runtime_error(SocketErrorString("sendmsg"));
             }
             offset += static_cast<size_t>(written);
         }
     }
 
-    void CloseSend() override {
-        bool expected = false;
-        if (!send_closed_.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
-            return;
-        }
-        if (fd_.load(std::memory_order_relaxed) < 0) {
-            return;
-        }
-        if (ssl_ != nullptr) {
-            std::lock_guard<std::mutex> lock(ssl_mutex_);
-            SSL_shutdown(ssl_);
-        }
-        if (::shutdown(fd_, SHUT_WR) != 0 && errno != ENOTCONN && errno != EBADF) {
-            throw std::runtime_error(SocketErrorString("shutdown(SHUT_WR)"));
-        }
-    }
-
-    void Close() override {
-        if (closed_.exchange(true, std::memory_order_relaxed)) {
-            return;
-        }
-        ::shutdown(fd_, SHUT_RDWR);
-        CloseFd();
-    }
-
-  private:
     void WaitForSocketReady(short events) {
         const int fd = fd_.load(std::memory_order_relaxed);
         if (fd < 0 || closed_.load(std::memory_order_relaxed)) {
@@ -1068,11 +1396,37 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
                     }
                 }
             } else {
-                bytes = recv(fd_, buffer.data(), buffer.size(), 0);
+                struct msghdr msg {};
+                struct iovec iov {};
+                iov.iov_base = buffer.data();
+                iov.iov_len = buffer.size();
+                char control[CMSG_SPACE(sizeof(sctp_rcvinfo))] {};
+                msg.msg_iov = &iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = control;
+                msg.msg_controllen = sizeof(control);
+                bytes = recvmsg(fd_, &msg, 0);
+                if (bytes > 0) {
+                    uint16_t stream_id = default_stream_id_;
+                    for (cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+                        if (cmsg->cmsg_level == IPPROTO_SCTP && cmsg->cmsg_type == SCTP_RCVINFO) {
+                            const auto* rcvinfo = reinterpret_cast<const sctp_rcvinfo*>(CMSG_DATA(cmsg));
+                            stream_id = rcvinfo->rcv_sid;
+                            break;
+                        }
+                    }
+                    try {
+                        handler_.OnData(shared_from_this(), stream_id, buffer.data(), static_cast<size_t>(bytes));
+                    } catch (const std::exception& ex) {
+                        handler_.OnTransportError(id_, ex.what());
+                        break;
+                    }
+                    continue;
+                }
             }
             if (bytes > 0) {
                 try {
-                    handler_.OnData(shared_from_this(), buffer.data(), static_cast<size_t>(bytes));
+                    handler_.OnData(shared_from_this(), default_stream_id_, buffer.data(), static_cast<size_t>(bytes));
                 } catch (const std::exception& ex) {
                     handler_.OnTransportError(id_, ex.what());
                     break;
@@ -1124,11 +1478,16 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
 
     std::atomic<int> fd_;
     const uint32_t id_;
-    const uint16_t stream_id_;
+    const uint16_t default_stream_id_;
     ITransportEventHandler& handler_;
     std::atomic<bool> closed_{false};
     std::atomic<bool> send_closed_{false};
     std::thread recv_thread_;
+    std::thread send_thread_;
+    std::mutex send_mutex_;
+    std::condition_variable send_cv_;
+    std::deque<PendingSend> pending_sends_;
+    std::atomic<bool> send_close_requested_{false};
     std::mutex ssl_mutex_;
     std::vector<uint8_t> poll_buffer_{std::vector<uint8_t>(64 * 1024)};
     SSL* ssl_{nullptr};
@@ -1136,7 +1495,7 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
 
 struct LoadServerConnectionState {
     std::shared_ptr<ITransportConnection> connection;
-    std::vector<uint8_t> receive_buffer;
+    std::map<uint16_t, std::vector<uint8_t>> receive_buffers;
     bool peer_closed{false};
 };
 
@@ -1151,25 +1510,34 @@ class LoadServerController : public ITransportEventHandler {
         std::cerr << ProtocolName(config_.protocol) << " server connection " << connection->Id() << " established" << std::endl;
     }
 
-    void OnData(const std::shared_ptr<ITransportConnection>& connection, const uint8_t* data, size_t length) override {
+    void OnData(
+        const std::shared_ptr<ITransportConnection>& connection,
+        uint16_t stream_id,
+        const uint8_t* data,
+        size_t length) override {
         std::vector<std::vector<uint8_t>> sends;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto& state = connections_[connection->Id()];
             state.connection = connection;
-            state.receive_buffer.insert(state.receive_buffer.end(), data, data + length);
-            while (state.receive_buffer.size() >= config_.message_size) {
-                std::vector<uint8_t> frame(config_.message_size);
-                std::memcpy(frame.data(), state.receive_buffer.data(), config_.message_size);
-                state.receive_buffer.erase(
-                    state.receive_buffer.begin(),
-                    state.receive_buffer.begin() + static_cast<std::ptrdiff_t>(config_.message_size));
+            auto& receive_buffer = state.receive_buffers[stream_id];
+            receive_buffer.insert(receive_buffer.end(), data, data + length);
+            while (true) {
+                const auto frame_size = TryPeekFrameSize(receive_buffer, config_.message_size);
+                if (!frame_size.has_value()) {
+                    break;
+                }
+                std::vector<uint8_t> frame(*frame_size);
+                std::memcpy(frame.data(), receive_buffer.data(), *frame_size);
+                receive_buffer.erase(
+                    receive_buffer.begin(),
+                    receive_buffer.begin() + static_cast<std::ptrdiff_t>(*frame_size));
                 sends.push_back(std::move(frame));
             }
         }
 
         for (const auto& frame : sends) {
-            connection->SendCopy(frame.data(), frame.size());
+            connection->SendCopy(frame.data(), frame.size(), stream_id);
             stats_.AddReceived(frame.size());
             stats_.AddSent(frame.size());
         }
@@ -1200,12 +1568,19 @@ class LoadServerController : public ITransportEventHandler {
     std::map<uint32_t, LoadServerConnectionState> connections_;
 };
 
-struct LoadClientConnectionState {
-    std::shared_ptr<ITransportConnection> connection;
+struct LoadClientStreamState {
+    AppConfig::StreamProfile profile;
     std::vector<uint8_t> receive_buffer;
     uint64_t next_sequence{0};
     uint64_t echoed_messages{0};
     double next_send_time_ns{0.0};
+};
+
+struct LoadClientConnectionState {
+    std::shared_ptr<ITransportConnection> connection;
+    std::map<uint16_t, LoadClientStreamState> streams;
+    double next_send_time_ns{0.0};
+    uint32_t next_send_stream_ordinal{0};
     bool connected{false};
     bool send_closed{false};
 };
@@ -1215,8 +1590,9 @@ class LoadClientController : public ITransportEventHandler {
     LoadClientController(const AppConfig& config, Stats& stats)
         : config_(config),
           stats_(stats),
+          stream_metrics_(config.stream_count),
           pacing_mode_(DeterminePacingMode(config)),
-          paced_(pacing_mode_ != PacingMode::Unlimited),
+          paced_(pacing_mode_ != PacingMode::Unlimited || HasStreamProfilePacing(config)),
           active_send_connection_count_(ActiveSendConnectionCount(config)),
           pacing_interval_ns_(ComputePacingIntervalNs(config, pacing_mode_, active_send_connection_count_)) {}
 
@@ -1249,6 +1625,11 @@ class LoadClientController : public ITransportEventHandler {
                 state.next_send_time_ns =
                     InitialPerClientSendTimeNs(connection->Id(), static_cast<double>(NowNs()));
             }
+            for (uint32_t ordinal = 0; ordinal < config_.stream_count; ++ordinal) {
+                const uint16_t stream_id = StreamIdFromOrdinal(ordinal);
+                auto& stream_state = state.streams[stream_id];
+                stream_state.profile = StreamProfileForOrdinal(config_, ordinal);
+            }
         }
         std::cerr << ProtocolName(config_.protocol) << " client connection " << connection->Id() << " established" << std::endl;
         if (!paced_) {
@@ -1256,25 +1637,37 @@ class LoadClientController : public ITransportEventHandler {
         }
     }
 
-    void OnData(const std::shared_ptr<ITransportConnection>& connection, const uint8_t* data, size_t length) override {
+    void OnData(
+        const std::shared_ptr<ITransportConnection>& connection,
+        uint16_t stream_id,
+        const uint8_t* data,
+        size_t length) override {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto& state = states_[connection->Id()];
             state.connection = connection;
-            state.receive_buffer.insert(state.receive_buffer.end(), data, data + length);
+            auto& stream_state = state.streams[stream_id];
+            if (stream_state.profile.name.empty()) {
+                stream_state.profile = StreamProfileForOrdinal(config_, stream_id - config_.sctp_stream_id);
+            }
+            stream_state.receive_buffer.insert(stream_state.receive_buffer.end(), data, data + length);
 
-            while (state.receive_buffer.size() >= config_.message_size) {
-                MessageHeader header{};
-                std::memcpy(&header, state.receive_buffer.data(), sizeof(header));
-                if (header.magic != kMessageMagic) {
-                    throw std::runtime_error("invalid echoed frame magic on connection " + std::to_string(connection->Id()));
+            while (true) {
+                const auto frame_size = TryPeekFrameSize(stream_state.receive_buffer, stream_state.profile.message_size);
+                if (!frame_size.has_value()) {
+                    break;
                 }
-                state.receive_buffer.erase(
-                    state.receive_buffer.begin(),
-                    state.receive_buffer.begin() + static_cast<std::ptrdiff_t>(config_.message_size));
-                ++state.echoed_messages;
-                stats_.AddReceived(config_.message_size);
-                stats_.AddLatencyNs(NowNs() - header.send_timestamp_ns);
+                MessageHeader header{};
+                std::memcpy(&header, stream_state.receive_buffer.data(), sizeof(header));
+                const uint32_t actual_frame_size = FrameSizeFromHeader(header, stream_state.profile.message_size);
+                stream_state.receive_buffer.erase(
+                    stream_state.receive_buffer.begin(),
+                    stream_state.receive_buffer.begin() + static_cast<std::ptrdiff_t>(actual_frame_size));
+                ++stream_state.echoed_messages;
+                const auto latency_ns = NowNs() - header.send_timestamp_ns;
+                stats_.AddReceived(actual_frame_size);
+                stats_.AddLatencyNs(latency_ns);
+                stream_metrics_[stream_id - config_.sctp_stream_id].AddReceived(actual_frame_size, latency_ns);
             }
         }
         if (!paced_) {
@@ -1337,6 +1730,27 @@ class LoadClientController : public ITransportEventHandler {
         });
     }
 
+    void PrintStreamSummaries(const char* prefix) const {
+        for (uint32_t ordinal = 0; ordinal < config_.stream_count; ++ordinal) {
+            const auto profile = StreamProfileForOrdinal(config_, ordinal);
+            const auto snapshot = stream_metrics_[ordinal].Snapshot();
+            std::cout << prefix
+                      << " name=" << profile.name
+                      << " stream_id=" << StreamIdFromOrdinal(ordinal)
+                      << " sent_messages=" << snapshot.sent_messages
+                      << " echoed_messages=" << snapshot.echoed_messages
+                      << " sent_bytes=" << snapshot.sent_bytes
+                      << " echoed_bytes=" << snapshot.echoed_bytes
+                      << " latency_ms(p50/p75/p99)=" << FormatLatencySummary(snapshot.latency)
+                      << std::endl;
+            std::cout << "client stream latency detail:"
+                      << " name=" << profile.name
+                      << " stream_id=" << StreamIdFromOrdinal(ordinal)
+                      << " " << FormatLatencyDetailSummary(snapshot.latency_detail)
+                      << std::endl;
+        }
+    }
+
   private:
     enum class PacingMode {
         Unlimited,
@@ -1392,6 +1806,21 @@ class LoadClientController : public ITransportEventHandler {
     bool ShouldSendOnConnection(uint32_t connection_id) const {
         return config_.send_server_index < 0 ||
                (connection_id % config_.server_count) == static_cast<uint32_t>(config_.send_server_index);
+    }
+
+    uint16_t StreamIdFromOrdinal(uint32_t ordinal) const {
+        return static_cast<uint16_t>(config_.sctp_stream_id + ordinal);
+    }
+
+    bool AllStreamsDrained(const LoadClientConnectionState& state) const {
+        for (uint32_t ordinal = 0; ordinal < config_.stream_count; ++ordinal) {
+            const uint16_t stream_id = StreamIdFromOrdinal(ordinal);
+            const auto it = state.streams.find(stream_id);
+            if (it != state.streams.end() && it->second.next_sequence != it->second.echoed_messages) {
+                return false;
+            }
+        }
+        return true;
     }
 
     void PacerLoop() {
@@ -1486,7 +1915,7 @@ class LoadClientController : public ITransportEventHandler {
 
     size_t PumpSends(uint32_t connection_id, size_t max_messages = std::numeric_limits<size_t>::max()) {
         std::shared_ptr<ITransportConnection> connection;
-        std::vector<std::vector<uint8_t>> sends;
+        std::vector<std::pair<uint16_t, std::vector<uint8_t>>> sends;
         bool should_close_send = false;
 
         {
@@ -1503,8 +1932,7 @@ class LoadClientController : public ITransportEventHandler {
 
             while (ShouldSendOnConnection(connection_id) &&
                    sends.size() < max_messages &&
-                   !stop_sending_.load(std::memory_order_relaxed) &&
-                   (state.next_sequence - state.echoed_messages) < config_.max_inflight) {
+                   !stop_sending_.load(std::memory_order_relaxed)) {
                 if (pacing_mode_ == PacingMode::PerClientPps) {
                     const double now_ns = static_cast<double>(NowNs());
                     if (state.next_send_time_ns == 0.0) {
@@ -1518,34 +1946,70 @@ class LoadClientController : public ITransportEventHandler {
                         state.next_send_time_ns = now_ns;
                     }
                 }
-                std::vector<uint8_t> frame(config_.message_size);
-                MessageHeader header{};
-                header.magic = kMessageMagic;
-                header.sequence = state.next_sequence++;
-                header.send_timestamp_ns = NowNs();
-                std::memcpy(frame.data(), &header, sizeof(header));
-                for (uint32_t i = sizeof(header); i < config_.message_size; ++i) {
-                    frame[i] = static_cast<uint8_t>(header.sequence + i);
+                bool selected_stream = false;
+                for (uint32_t attempt = 0; attempt < config_.stream_count; ++attempt) {
+                    const uint32_t ordinal = (state.next_send_stream_ordinal + attempt) % config_.stream_count;
+                    const uint16_t stream_id = StreamIdFromOrdinal(ordinal);
+                    auto& stream_state = state.streams[stream_id];
+                    if (stream_state.profile.name.empty()) {
+                        stream_state.profile = StreamProfileForOrdinal(config_, ordinal);
+                    }
+                    if ((stream_state.next_sequence - stream_state.echoed_messages) >= stream_state.profile.max_inflight) {
+                        continue;
+                    }
+                    if (stream_state.profile.send_pps > 0) {
+                        const double now_ns = static_cast<double>(NowNs());
+                        if (stream_state.next_send_time_ns == 0.0) {
+                            stream_state.next_send_time_ns = now_ns;
+                        }
+                        if (stream_state.next_send_time_ns > now_ns) {
+                            continue;
+                        }
+                        const double interval_ns = 1'000'000'000.0 / static_cast<double>(stream_state.profile.send_pps);
+                        stream_state.next_send_time_ns += interval_ns;
+                        if (stream_state.next_send_time_ns + (interval_ns * 4.0) < now_ns) {
+                            stream_state.next_send_time_ns = now_ns;
+                        }
+                    }
+                    std::vector<uint8_t> frame(stream_state.profile.message_size);
+                    MessageHeader header{};
+                    header.magic = kMessageMagic;
+                    header.reserved = static_cast<uint32_t>(frame.size());
+                    header.sequence = stream_state.next_sequence++;
+                    header.send_timestamp_ns = NowNs();
+                    std::memcpy(frame.data(), &header, sizeof(header));
+                    for (uint32_t i = sizeof(header); i < frame.size(); ++i) {
+                        frame[i] = static_cast<uint8_t>(header.sequence + i);
+                    }
+                    sends.push_back({stream_id, std::move(frame)});
+                    state.next_send_stream_ordinal = (ordinal + 1) % config_.stream_count;
+                    selected_stream = true;
+                    break;
                 }
-                sends.push_back(std::move(frame));
+                if (!selected_stream) {
+                    break;
+                }
             }
 
             if (stop_sending_.load(std::memory_order_relaxed) &&
-                state.next_sequence == state.echoed_messages &&
+                AllStreamsDrained(state) &&
                 !state.send_closed) {
                 state.send_closed = true;
                 should_close_send = true;
             }
         }
 
-        for (auto& frame : sends) {
+        for (auto& send : sends) {
+            auto& stream_id = send.first;
+            auto& frame = send.second;
             try {
                 MessageHeader header{};
                 std::memcpy(&header, frame.data(), sizeof(header));
                 header.send_timestamp_ns = NowNs();
                 std::memcpy(frame.data(), &header, sizeof(header));
-                connection->SendCopy(frame.data(), frame.size());
+                connection->SendCopy(frame.data(), frame.size(), stream_id);
                 stats_.AddSent(frame.size());
+                stream_metrics_[stream_id - config_.sctp_stream_id].AddSent(frame.size());
             } catch (const std::exception& ex) {
                 connection->Close();
                 throw;
@@ -1568,6 +2032,7 @@ class LoadClientController : public ITransportEventHandler {
     std::condition_variable done_cv_;
     std::map<uint32_t, LoadClientConnectionState> states_;
     std::set<uint32_t> closed_connections_;
+    std::vector<StreamMetrics> stream_metrics_;
     std::atomic<bool> stop_sending_{false};
     const PacingMode pacing_mode_{PacingMode::Unlimited};
     const bool paced_{false};
@@ -1670,6 +2135,17 @@ class SctpServerTransport : public ITransportRunner {
         if (::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
             throw std::runtime_error(SocketErrorString("setsockopt(SO_REUSEADDR)"));
         }
+        int buffer_size = 4 * 1024 * 1024;
+        if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) != 0) {
+            throw std::runtime_error(SocketErrorString("setsockopt(SO_SNDBUF)"));
+        }
+        if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) != 0) {
+            throw std::runtime_error(SocketErrorString("setsockopt(SO_RCVBUF)"));
+        }
+        int fragment_interleave = 2;
+        if (::setsockopt(fd, IPPROTO_SCTP, SCTP_FRAGMENT_INTERLEAVE, &fragment_interleave, sizeof(fragment_interleave)) != 0) {
+            throw std::runtime_error(SocketErrorString("setsockopt(SCTP_FRAGMENT_INTERLEAVE)"));
+        }
         int nodelay = config_.sctp_nodelay ? 1 : 0;
         if (::setsockopt(fd, IPPROTO_SCTP, SCTP_NODELAY, &nodelay, sizeof(nodelay)) != 0) {
             throw std::runtime_error(SocketErrorString("setsockopt(SCTP_NODELAY)"));
@@ -1678,6 +2154,16 @@ class SctpServerTransport : public ITransportRunner {
         sndinfo.snd_sid = config_.sctp_stream_id;
         if (::setsockopt(fd, IPPROTO_SCTP, SCTP_DEFAULT_SNDINFO, &sndinfo, sizeof(sndinfo)) != 0) {
             throw std::runtime_error(SocketErrorString("setsockopt(SCTP_DEFAULT_SNDINFO)"));
+        }
+        sctp_initmsg initmsg{};
+        initmsg.sinit_num_ostreams = static_cast<uint16_t>(config_.sctp_stream_id + config_.stream_count);
+        initmsg.sinit_max_instreams = static_cast<uint16_t>(config_.sctp_stream_id + config_.stream_count);
+        if (::setsockopt(fd, IPPROTO_SCTP, SCTP_INITMSG, &initmsg, sizeof(initmsg)) != 0) {
+            throw std::runtime_error(SocketErrorString("setsockopt(SCTP_INITMSG)"));
+        }
+        int recvrcvinfo = 1;
+        if (::setsockopt(fd, IPPROTO_SCTP, SCTP_RECVRCVINFO, &recvrcvinfo, sizeof(recvrcvinfo)) != 0) {
+            throw std::runtime_error(SocketErrorString("setsockopt(SCTP_RECVRCVINFO)"));
         }
         if (config_.sctp_tls) {
             sctp_event_subscribe events{};
@@ -1918,6 +2404,17 @@ class SctpClientTransport : public ITransportRunner {
     }
 
     void ConfigureSocket(int fd) const {
+        int buffer_size = 4 * 1024 * 1024;
+        if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) != 0) {
+            throw std::runtime_error(SocketErrorString("setsockopt(SO_SNDBUF)"));
+        }
+        if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) != 0) {
+            throw std::runtime_error(SocketErrorString("setsockopt(SO_RCVBUF)"));
+        }
+        int fragment_interleave = 2;
+        if (::setsockopt(fd, IPPROTO_SCTP, SCTP_FRAGMENT_INTERLEAVE, &fragment_interleave, sizeof(fragment_interleave)) != 0) {
+            throw std::runtime_error(SocketErrorString("setsockopt(SCTP_FRAGMENT_INTERLEAVE)"));
+        }
         int nodelay = config_.sctp_nodelay ? 1 : 0;
         if (::setsockopt(fd, IPPROTO_SCTP, SCTP_NODELAY, &nodelay, sizeof(nodelay)) != 0) {
             throw std::runtime_error(SocketErrorString("setsockopt(SCTP_NODELAY)"));
@@ -1926,6 +2423,16 @@ class SctpClientTransport : public ITransportRunner {
         sndinfo.snd_sid = config_.sctp_stream_id;
         if (::setsockopt(fd, IPPROTO_SCTP, SCTP_DEFAULT_SNDINFO, &sndinfo, sizeof(sndinfo)) != 0) {
             throw std::runtime_error(SocketErrorString("setsockopt(SCTP_DEFAULT_SNDINFO)"));
+        }
+        sctp_initmsg initmsg{};
+        initmsg.sinit_num_ostreams = static_cast<uint16_t>(config_.sctp_stream_id + config_.stream_count);
+        initmsg.sinit_max_instreams = static_cast<uint16_t>(config_.sctp_stream_id + config_.stream_count);
+        if (::setsockopt(fd, IPPROTO_SCTP, SCTP_INITMSG, &initmsg, sizeof(initmsg)) != 0) {
+            throw std::runtime_error(SocketErrorString("setsockopt(SCTP_INITMSG)"));
+        }
+        int recvrcvinfo = 1;
+        if (::setsockopt(fd, IPPROTO_SCTP, SCTP_RECVRCVINFO, &recvrcvinfo, sizeof(recvrcvinfo)) != 0) {
+            throw std::runtime_error(SocketErrorString("setsockopt(SCTP_RECVRCVINFO)"));
         }
         if (config_.sctp_tls) {
             sctp_event_subscribe events{};
@@ -2041,6 +2548,7 @@ class SctpClient {
                   << " latency_ms(p50/p75/p99)="
                   << FormatLatencySummary(snapshot.latency)
                   << std::endl;
+        controller_.PrintStreamSummaries("client stream summary:");
     }
 
     const AppConfig& config_;
@@ -2112,7 +2620,7 @@ class Configuration {
         settings.IsSet.IdleTimeoutMs = TRUE;
 
         if (!is_client) {
-            settings.PeerBidiStreamCount = 1;
+            settings.PeerBidiStreamCount = config.stream_count;
             settings.IsSet.PeerBidiStreamCount = TRUE;
         }
 
@@ -2354,12 +2862,16 @@ class Server {
                         buffer->Buffer + buffer->Length);
                 }
 
-                while (context->receive_buffer.size() >= config_.message_size) {
-                    auto send = std::make_unique<SendBuffer>(config_.message_size);
-                    std::memcpy(send->storage.data(), context->receive_buffer.data(), config_.message_size);
+                while (true) {
+                    const auto frame_size = TryPeekFrameSize(context->receive_buffer, config_.message_size);
+                    if (!frame_size.has_value()) {
+                        break;
+                    }
+                    auto send = std::make_unique<SendBuffer>(*frame_size);
+                    std::memcpy(send->storage.data(), context->receive_buffer.data(), *frame_size);
                     context->receive_buffer.erase(
                         context->receive_buffer.begin(),
-                        context->receive_buffer.begin() + static_cast<std::ptrdiff_t>(config_.message_size));
+                        context->receive_buffer.begin() + static_cast<std::ptrdiff_t>(*frame_size));
                     ++context->pending_sends;
                     sends.push_back(std::move(send));
                 }
@@ -2381,8 +2893,8 @@ class Server {
                     delete raw_send;
                     return status;
                 }
-                stats_.AddReceived(config_.message_size);
-                stats_.AddSent(config_.message_size);
+                stats_.AddReceived(raw_send->quic_buffer.Length);
+                stats_.AddSent(raw_send->quic_buffer.Length);
             }
 
             {
@@ -2442,9 +2954,10 @@ class Client {
           api_(),
           registration_(api_, "msquic-loadtest-client"),
           configuration_(api_, registration_.get(), config_, true),
+          stream_metrics_(config.stream_count),
           stats_printer_("client", stats_, config_.stats_interval_ms),
           pacing_mode_(DeterminePacingMode(config)),
-          paced_(pacing_mode_ != PacingMode::Unlimited),
+          paced_(pacing_mode_ != PacingMode::Unlimited || HasStreamProfilePacing(config)),
           active_send_connection_count_(ActiveSendConnectionCount(config)),
           pacing_interval_ns_(ComputePacingIntervalNs(config, pacing_mode_, active_send_connection_count_)) {}
 
@@ -2529,8 +3042,11 @@ class Client {
     struct ConnectionContext;
 
     struct StreamContext {
-        explicit StreamContext(ConnectionContext& owner) : owner(owner) {}
+        StreamContext(ConnectionContext& owner, uint32_t ordinal) : owner(owner), ordinal(ordinal) {}
         ConnectionContext& owner;
+        const uint32_t ordinal;
+        AppConfig::StreamProfile profile;
+        HQUIC stream{nullptr};
         std::mutex mutex;
         std::vector<uint8_t> receive_buffer;
         uint64_t next_sequence{0};
@@ -2538,6 +3054,7 @@ class Client {
         double next_send_time_ns{0.0};
         bool stream_started{false};
         bool shutdown_started{false};
+        bool closed{false};
     };
 
     struct ConnectionContext {
@@ -2548,9 +3065,10 @@ class Client {
         uint32_t index;
         uint16_t port;
         HQUIC connection{nullptr};
-        HQUIC stream{nullptr};
         std::mutex mutex;
-        std::unique_ptr<StreamContext> stream_ctx;
+        std::vector<std::unique_ptr<StreamContext>> stream_contexts;
+        double next_send_time_ns{0.0};
+        uint32_t next_send_stream_ordinal{0};
         bool connected{false};
         bool closed{false};
     };
@@ -2569,10 +3087,11 @@ class Client {
         HQUIC stream,
         void* context,
         QUIC_STREAM_EVENT* event) {
-        return static_cast<StreamContext*>(context)->owner.owner.OnStreamEvent(
-            static_cast<StreamContext*>(context)->owner,
+        auto* stream_context = static_cast<StreamContext*>(context);
+        return stream_context->owner.owner.OnStreamEvent(
+            stream_context->owner,
             stream,
-            static_cast<StreamContext*>(context),
+            stream_context,
             event);
     }
 
@@ -2617,6 +3136,24 @@ class Client {
                (connection.index % config_.server_count) == static_cast<uint32_t>(config_.send_server_index);
     }
 
+    bool AllStreamsDrained(const ConnectionContext& connection) const {
+        for (const auto& stream_ctx : connection.stream_contexts) {
+            if (!stream_ctx->closed && stream_ctx->next_sequence != stream_ctx->echoed_messages) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool AllStreamsClosed(const ConnectionContext& connection) const {
+        for (const auto& stream_ctx : connection.stream_contexts) {
+            if (!stream_ctx->closed) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     void StartPacer() {
         if (!paced_) {
             return;
@@ -2638,15 +3175,12 @@ class Client {
             double earliest_next_send_ns = std::numeric_limits<double>::max();
             for (auto& connection : connections_) {
                 std::lock_guard<std::mutex> lock(connection->mutex);
-                if (connection->stream_ctx != nullptr && connection->stream != nullptr) {
-                    if (PumpSends(*connection, connection->stream, *connection->stream_ctx) > 0) {
+                if (!connection->stream_contexts.empty()) {
+                    if (PumpSends(*connection, 1) > 0) {
                         did_work = true;
                     }
-                    std::lock_guard<std::mutex> stream_lock(connection->stream_ctx->mutex);
-                    if (connection->stream_ctx->stream_started &&
-                        !connection->stream_ctx->shutdown_started &&
-                        connection->stream_ctx->next_send_time_ns > 0.0) {
-                        earliest_next_send_ns = std::min(earliest_next_send_ns, connection->stream_ctx->next_send_time_ns);
+                    if (connection->next_send_time_ns > 0.0) {
+                        earliest_next_send_ns = std::min(earliest_next_send_ns, connection->next_send_time_ns);
                     }
                 }
             }
@@ -2664,98 +3198,139 @@ class Client {
         }
     }
 
-    void StartStream(ConnectionContext& connection) {
+    void StartStreams(ConnectionContext& connection) {
         std::lock_guard<std::mutex> lock(connection.mutex);
-        if (connection.stream != nullptr) {
+        if (!connection.stream_contexts.empty()) {
             return;
         }
-
-        connection.stream_ctx = std::make_unique<StreamContext>(connection);
-        HQUIC stream = nullptr;
-        const auto open_status =
-            api_->StreamOpen(connection.connection, QUIC_STREAM_OPEN_FLAG_NONE, StreamCallback, connection.stream_ctx.get(), &stream);
-        if (QUIC_FAILED(open_status)) {
-            std::cerr << "StreamOpen failed: " << StatusToHex(open_status) << std::endl;
-            api_->ConnectionShutdown(connection.connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 1);
-            return;
-        }
-
-        connection.stream = stream;
-        const auto start_status = api_->StreamStart(stream, QUIC_STREAM_START_FLAG_NONE);
-        if (QUIC_FAILED(start_status)) {
-            connection.stream = nullptr;
-            api_->StreamClose(stream);
-            std::cerr << "StreamStart failed: " << StatusToHex(start_status) << std::endl;
-            api_->ConnectionShutdown(connection.connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 1);
-            return;
+        connection.stream_contexts.reserve(config_.stream_count);
+        for (uint32_t ordinal = 0; ordinal < config_.stream_count; ++ordinal) {
+            auto stream_ctx = std::make_unique<StreamContext>(connection, ordinal);
+            stream_ctx->profile = StreamProfileForOrdinal(config_, ordinal);
+            HQUIC stream = nullptr;
+            const auto open_status =
+                api_->StreamOpen(connection.connection, QUIC_STREAM_OPEN_FLAG_NONE, StreamCallback, stream_ctx.get(), &stream);
+            if (QUIC_FAILED(open_status)) {
+                std::cerr << "StreamOpen failed: " << StatusToHex(open_status) << std::endl;
+                api_->ConnectionShutdown(connection.connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 1);
+                return;
+            }
+            stream_ctx->stream = stream;
+            const auto start_status = api_->StreamStart(stream, QUIC_STREAM_START_FLAG_NONE);
+            if (QUIC_FAILED(start_status)) {
+                api_->StreamClose(stream);
+                std::cerr << "StreamStart failed: " << StatusToHex(start_status) << std::endl;
+                api_->ConnectionShutdown(connection.connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 1);
+                return;
+            }
+            connection.stream_contexts.push_back(std::move(stream_ctx));
         }
     }
 
-    size_t PumpSends(ConnectionContext& connection, HQUIC stream, StreamContext& stream_ctx) {
-        std::lock_guard<std::mutex> lock(stream_ctx.mutex);
-        if (!stream_ctx.stream_started || stream_ctx.shutdown_started) {
-            return 0;
-        }
-
+    size_t PumpSends(ConnectionContext& connection, size_t max_messages = std::numeric_limits<size_t>::max()) {
         size_t send_count = 0;
         while (ShouldSendOnConnection(connection) &&
-               !stop_sending_.load(std::memory_order_relaxed) &&
-               (stream_ctx.next_sequence - stream_ctx.echoed_messages) < config_.max_inflight) {
+               send_count < max_messages &&
+               !stop_sending_.load(std::memory_order_relaxed)) {
             if (paced_) {
                 const double now_ns = static_cast<double>(NowNs());
-                if (stream_ctx.next_send_time_ns == 0.0) {
-                    stream_ctx.next_send_time_ns = now_ns;
+                if (connection.next_send_time_ns == 0.0) {
+                    connection.next_send_time_ns = now_ns;
                 }
-                if (stream_ctx.next_send_time_ns > now_ns) {
+                if (connection.next_send_time_ns > now_ns) {
                     break;
                 }
                 if (pacing_interval_ns_ > 0.0) {
-                    stream_ctx.next_send_time_ns += pacing_interval_ns_;
-                    if (stream_ctx.next_send_time_ns + (pacing_interval_ns_ * 4.0) < now_ns) {
-                        stream_ctx.next_send_time_ns = now_ns;
+                    connection.next_send_time_ns += pacing_interval_ns_;
+                    if (connection.next_send_time_ns + (pacing_interval_ns_ * 4.0) < now_ns) {
+                        connection.next_send_time_ns = now_ns;
                     }
                 }
             }
 
-            auto send = std::make_unique<SendBuffer>(config_.message_size);
+            StreamContext* selected_stream = nullptr;
+            for (uint32_t attempt = 0; attempt < connection.stream_contexts.size(); ++attempt) {
+                const uint32_t ordinal = (connection.next_send_stream_ordinal + attempt) % connection.stream_contexts.size();
+                auto& candidate = connection.stream_contexts[ordinal];
+                std::lock_guard<std::mutex> stream_lock(candidate->mutex);
+                if (!candidate->stream_started || candidate->shutdown_started || candidate->closed) {
+                    continue;
+                }
+                if ((candidate->next_sequence - candidate->echoed_messages) >= candidate->profile.max_inflight) {
+                    continue;
+                }
+                if (candidate->profile.send_pps > 0) {
+                    const double now_ns = static_cast<double>(NowNs());
+                    if (candidate->next_send_time_ns == 0.0) {
+                        candidate->next_send_time_ns = now_ns;
+                    }
+                    if (candidate->next_send_time_ns > now_ns) {
+                        continue;
+                    }
+                    const double interval_ns = 1'000'000'000.0 / static_cast<double>(candidate->profile.send_pps);
+                    candidate->next_send_time_ns += interval_ns;
+                    if (candidate->next_send_time_ns + (interval_ns * 4.0) < now_ns) {
+                        candidate->next_send_time_ns = now_ns;
+                    }
+                }
+                if (candidate->profile.name.empty()) {
+                    continue;
+                }
+                selected_stream = candidate.get();
+                connection.next_send_stream_ordinal = (ordinal + 1) % connection.stream_contexts.size();
+                break;
+            }
+            if (selected_stream == nullptr) {
+                break;
+            }
+
+            auto send = std::make_unique<SendBuffer>(selected_stream->profile.message_size);
 
             MessageHeader header{};
             header.magic = kMessageMagic;
-            header.sequence = stream_ctx.next_sequence++;
+            header.reserved = static_cast<uint32_t>(send->storage.size());
+            {
+                std::lock_guard<std::mutex> stream_lock(selected_stream->mutex);
+                header.sequence = selected_stream->next_sequence++;
+            }
             header.send_timestamp_ns = 0;
             std::memcpy(send->storage.data(), &header, sizeof(header));
 
-            for (uint32_t i = sizeof(header); i < config_.message_size; ++i) {
+            for (uint32_t i = sizeof(header); i < send->storage.size(); ++i) {
                 send->storage[i] = static_cast<uint8_t>(header.sequence + i);
             }
 
             auto* raw_send = send.release();
             header.send_timestamp_ns = NowNs();
             std::memcpy(raw_send->storage.data(), &header, sizeof(header));
-            const auto status = api_->StreamSend(stream, &raw_send->quic_buffer, 1, QUIC_SEND_FLAG_NONE, raw_send);
+            const auto status = api_->StreamSend(selected_stream->stream, &raw_send->quic_buffer, 1, QUIC_SEND_FLAG_NONE, raw_send);
             if (QUIC_FAILED(status)) {
                 delete raw_send;
                 std::cerr << "StreamSend failed: " << StatusToHex(status) << std::endl;
                 api_->ConnectionShutdown(connection.connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 1);
                 return send_count;
             }
-            stats_.AddSent(config_.message_size);
+            stats_.AddSent(raw_send->quic_buffer.Length);
+            stream_metrics_[selected_stream->ordinal].AddSent(raw_send->quic_buffer.Length);
             ++send_count;
         }
 
-        if (stop_sending_.load(std::memory_order_relaxed) &&
-            !stream_ctx.shutdown_started &&
-            stream_ctx.next_sequence == stream_ctx.echoed_messages) {
-            stream_ctx.shutdown_started = true;
-            api_->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+        if (stop_sending_.load(std::memory_order_relaxed) && AllStreamsDrained(connection)) {
+            for (auto& stream_ctx : connection.stream_contexts) {
+                std::lock_guard<std::mutex> stream_lock(stream_ctx->mutex);
+                if (!stream_ctx->shutdown_started && !stream_ctx->closed && stream_ctx->stream_started) {
+                    stream_ctx->shutdown_started = true;
+                    api_->StreamShutdown(stream_ctx->stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+                }
+            }
         }
         return send_count;
     }
 
     void RequestStopSending(ConnectionContext& connection) {
         std::lock_guard<std::mutex> lock(connection.mutex);
-        if (connection.stream_ctx != nullptr && connection.stream != nullptr) {
-            PumpSends(connection, connection.stream, *connection.stream_ctx);
+        if (!connection.stream_contexts.empty()) {
+            PumpSends(connection, 0);
         } else if (connection.connection != nullptr) {
             api_->ConnectionShutdown(connection.connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
         }
@@ -2773,7 +3348,7 @@ class Client {
         case QUIC_CONNECTION_EVENT_CONNECTED:
             std::cerr << "client connection " << connection.index << " established" << std::endl;
             connection.connected = true;
-            StartStream(connection);
+            StartStreams(connection);
             break;
         case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
             std::cerr << "client connection " << connection.index
@@ -2817,7 +3392,8 @@ class Client {
                 stream_ctx->stream_started = true;
             }
             if (!paced_) {
-                PumpSends(connection, stream, *stream_ctx);
+                std::lock_guard<std::mutex> connection_lock(connection.mutex);
+                PumpSends(connection);
             }
             break;
         }
@@ -2832,28 +3408,29 @@ class Client {
                         buffer->Buffer + buffer->Length);
                 }
 
-                while (stream_ctx->receive_buffer.size() >= config_.message_size) {
+                while (true) {
+                    const auto frame_size = TryPeekFrameSize(stream_ctx->receive_buffer, stream_ctx->profile.message_size);
+                    if (!frame_size.has_value()) {
+                        break;
+                    }
                     MessageHeader header{};
                     std::memcpy(&header, stream_ctx->receive_buffer.data(), sizeof(header));
-                    if (header.magic != kMessageMagic) {
-                        std::cerr << "invalid echoed frame magic on client " << connection.index << std::endl;
-                        api_->ConnectionShutdown(connection.connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 1);
-                        return QUIC_STATUS_PROTOCOL_ERROR;
-                    }
-
+                    const uint32_t actual_frame_size = FrameSizeFromHeader(header, stream_ctx->profile.message_size);
                     const auto latency_ns = NowNs() - header.send_timestamp_ns;
-                    stats_.AddReceived(config_.message_size);
+                    stats_.AddReceived(actual_frame_size);
                     stats_.AddLatencyNs(latency_ns);
+                    stream_metrics_[stream_ctx->ordinal].AddReceived(actual_frame_size, latency_ns);
                     ++stream_ctx->echoed_messages;
 
                     stream_ctx->receive_buffer.erase(
                         stream_ctx->receive_buffer.begin(),
-                        stream_ctx->receive_buffer.begin() + static_cast<std::ptrdiff_t>(config_.message_size));
+                        stream_ctx->receive_buffer.begin() + static_cast<std::ptrdiff_t>(actual_frame_size));
                 }
             }
 
             if (!paced_) {
-                PumpSends(connection, stream, *stream_ctx);
+                std::lock_guard<std::mutex> connection_lock(connection.mutex);
+                PumpSends(connection);
             }
             break;
         }
@@ -2861,8 +3438,17 @@ class Client {
             delete static_cast<SendBuffer*>(event->SEND_COMPLETE.ClientContext);
             break;
         case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
+            {
+                std::lock_guard<std::mutex> lock(stream_ctx->mutex);
+                stream_ctx->closed = true;
+            }
             api_->StreamClose(stream);
-            api_->ConnectionShutdown(connection.connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+            {
+                std::lock_guard<std::mutex> connection_lock(connection.mutex);
+                if (AllStreamsClosed(connection)) {
+                    api_->ConnectionShutdown(connection.connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+                }
+            }
             break;
         default:
             break;
@@ -2880,6 +3466,24 @@ class Client {
                   << " latency_ms(p50/p75/p99)="
                   << FormatLatencySummary(snapshot.latency)
                   << std::endl;
+        for (uint32_t ordinal = 0; ordinal < config_.stream_count; ++ordinal) {
+            const auto profile = StreamProfileForOrdinal(config_, ordinal);
+            const auto stream_snapshot = stream_metrics_[ordinal].Snapshot();
+            std::cout << "client stream summary:"
+                      << " name=" << profile.name
+                      << " stream_id=" << ordinal
+                      << " sent_messages=" << stream_snapshot.sent_messages
+                      << " echoed_messages=" << stream_snapshot.echoed_messages
+                      << " sent_bytes=" << stream_snapshot.sent_bytes
+                      << " echoed_bytes=" << stream_snapshot.echoed_bytes
+                      << " latency_ms(p50/p75/p99)=" << FormatLatencySummary(stream_snapshot.latency)
+                      << std::endl;
+            std::cout << "client stream latency detail:"
+                      << " name=" << profile.name
+                      << " stream_id=" << ordinal
+                      << " " << FormatLatencyDetailSummary(stream_snapshot.latency_detail)
+                      << std::endl;
+        }
     }
 
     AppConfig config_;
@@ -2887,6 +3491,7 @@ class Client {
     Registration registration_;
     Configuration configuration_;
     Stats stats_;
+    std::vector<StreamMetrics> stream_metrics_;
     StatsPrinter stats_printer_;
     std::vector<std::unique_ptr<ConnectionContext>> connections_;
     std::atomic<uint32_t> active_connections_{0};

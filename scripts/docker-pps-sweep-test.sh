@@ -13,7 +13,7 @@ CLIENTS="${CLIENTS:-8}"
 SERVER_COUNT="${SERVER_COUNT:-1}"
 PPS_VALUES="${PPS_VALUES:-1000 2000 5000 8000 10000 12000}"
 PPS_MODE="${PPS_MODE:-total}"
-PROTOCOLS="${PROTOCOLS:-msquic sctp}"
+PROTOCOLS="${PROTOCOLS:-msquic sctp sctp-dtls}"
 DOCKER_BIN="${DOCKER_BIN:-$(command -v docker 2>/dev/null || true)}"
 CPU_SAMPLE_INTERVAL_SEC="${CPU_SAMPLE_INTERVAL_SEC:-0.5}"
 CPU_SAMPLE_ACTIVE_FLOOR_RATIO="${CPU_SAMPLE_ACTIVE_FLOOR_RATIO:-0.10}"
@@ -59,6 +59,10 @@ protocol_server_args() {
   if [[ "${protocol}" == "sctp" ]]; then
     printf '%s\n' \
       "server" \
+      "--protocol=sctp"
+  elif [[ "${protocol}" == "sctp-dtls" ]]; then
+    printf '%s\n' \
+      "server" \
       "--protocol=sctp" \
       "--sctp-tls=1" \
       "--cert=/opt/msquic-loadtest/certs/server.crt" \
@@ -81,6 +85,12 @@ protocol_client_args() {
     rate_arg="--send-pps-per-client=${pps}"
   fi
   if [[ "${protocol}" == "sctp" ]]; then
+    printf '%s\n' \
+      "client" \
+      "--protocol=sctp" \
+      "--target=${target}" \
+      "${rate_arg}"
+  elif [[ "${protocol}" == "sctp-dtls" ]]; then
     printf '%s\n' \
       "client" \
       "--protocol=sctp" \
@@ -248,7 +258,7 @@ for protocol in ${PROTOCOLS}; do
     mapfile -t client_args < <(protocol_client_args "${protocol}" "pps-server" "${pps}")
     server_run_opts=()
     client_run_opts=()
-    if [[ "${protocol}" == "sctp" ]]; then
+    if [[ "${protocol}" == "sctp-dtls" ]]; then
       server_run_opts+=(--sysctl net.sctp.auth_enable=1)
       client_run_opts+=(--sysctl net.sctp.auth_enable=1)
     fi
