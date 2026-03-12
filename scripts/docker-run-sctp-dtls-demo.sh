@@ -6,6 +6,7 @@ SERVER_CONTAINER="${SERVER_CONTAINER:-msquic-loadtest-server}"
 CLIENT_CONTAINER="${CLIENT_CONTAINER:-msquic-loadtest-client}"
 PORT="${PORT:-15443}"
 DOCKER_BIN="${DOCKER_BIN:-$(command -v docker 2>/dev/null || true)}"
+NOFILE_ULIMIT="${NOFILE_ULIMIT:-40960:40960}"
 
 if [[ -z "${DOCKER_BIN}" ]]; then
   echo "docker binary not found in PATH" >&2
@@ -22,6 +23,7 @@ trap cleanup EXIT
 "${DOCKER_BIN}" run -d --rm \
   --name "${SERVER_CONTAINER}" \
   --network host \
+  --ulimit "nofile=${NOFILE_ULIMIT}" \
   "${IMAGE_NAME}" \
   server \
   --protocol=sctp \
@@ -38,6 +40,7 @@ sleep 1
 "${DOCKER_BIN}" run --rm \
   --name "${CLIENT_CONTAINER}" \
   --network host \
+  --ulimit "nofile=${NOFILE_ULIMIT}" \
   "${IMAGE_NAME}" \
   client \
   --protocol=sctp \

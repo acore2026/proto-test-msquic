@@ -54,7 +54,7 @@ Run a quick DTLS-over-SCTP smoke test:
 Run the image manually:
 
 ```bash
-docker run --rm ghcr.io/acore2026/proto-test-msquic:latest help
+docker run --rm --ulimit nofile=40960:40960 ghcr.io/acore2026/proto-test-msquic:latest help
 ```
 
 If you already exported the image to disk:
@@ -134,6 +134,7 @@ DTLS-over-SCTP with the Docker image:
 
 ```bash
 docker run --rm -d \
+  --ulimit nofile=40960:40960 \
   --name sctp-server \
   --network host \
   --sysctl net.sctp.auth_enable=1 \
@@ -146,6 +147,7 @@ docker run --rm -d \
   --base-port=15443
 
 docker run --rm \
+  --ulimit nofile=40960:40960 \
   --network host \
   --sysctl net.sctp.auth_enable=1 \
   ghcr.io/acore2026/proto-test-msquic:latest \
@@ -227,6 +229,7 @@ Fixed-rate test with DTLS-over-SCTP in Docker:
 
 ```bash
 docker run --rm \
+  --ulimit nofile=40960:40960 \
   --network bridge \
   --sysctl net.sctp.auth_enable=1 \
   ghcr.io/acore2026/proto-test-msquic:latest \

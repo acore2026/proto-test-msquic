@@ -17,6 +17,7 @@ EVEN_DISTRIBUTION="${EVEN_DISTRIBUTION:-1}"
 PROTOCOLS="${PROTOCOLS:-msquic sctp sctp-dtls}"
 DOCKER_BIN="${DOCKER_BIN:-$(command -v docker 2>/dev/null || true)}"
 CPU_SAMPLE_INTERVAL_SEC="${CPU_SAMPLE_INTERVAL_SEC:-0.5}"
+NOFILE_ULIMIT="${NOFILE_ULIMIT:-40960:40960}"
 
 if [[ -z "${DOCKER_BIN}" ]]; then
   echo "docker binary not found in PATH" >&2
@@ -216,6 +217,7 @@ for protocol in ${PROTOCOLS}; do
       "${DOCKER_BIN}" run -d --rm \
         --name scale-server \
         --network "${NETWORK_NAME}" \
+        --ulimit "nofile=${NOFILE_ULIMIT}" \
         "${server_run_opts[@]}" \
         "${IMAGE_NAME}" \
         "${server_args[@]}" \
@@ -235,6 +237,7 @@ for protocol in ${PROTOCOLS}; do
       if ! "${DOCKER_BIN}" run --rm \
         --name scale-client \
         --network "${NETWORK_NAME}" \
+        --ulimit "nofile=${NOFILE_ULIMIT}" \
         "${client_run_opts[@]}" \
         "${IMAGE_NAME}" \
         "${client_args[@]}" \
