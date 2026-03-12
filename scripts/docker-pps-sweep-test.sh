@@ -128,49 +128,84 @@ sample_cpu_stats() {
   local output_file="$2"
   shift 2
   local containers=("$@")
+  local interval="${CPU_SAMPLE_INTERVAL_SEC}"
+
+  if ! awk -v interval="${interval}" 'BEGIN { exit(interval > 0 ? 0 : 1) }'; then
+    echo "CPU_SAMPLE_INTERVAL_SEC must be > 0" >&2
+    return 2
+  fi
 
   : >"${output_file}"
   while [[ ! -f "${stop_file}" ]]; do
-    local stats_output
-    stats_output="$("${DOCKER_BIN}" stats --no-stream --format '{{.Name}},{{.CPUPerc}}' "${containers[@]}" 2>/dev/null || true)"
-    if [[ -n "${stats_output}" ]]; then
-      while IFS= read -r line; do
-        [[ -z "${line}" ]] && continue
-        local name="${line%%,*}"
-        local cpu="${line#*,}"
-        cpu="${cpu%\%}"
-        if [[ "${cpu}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-          printf '%s,%s\n' "${name}" "${cpu}" >>"${output_file}"
+    local now_ns
+    now_ns="$(date +%s%N)"
+    local name
+    for name in "${containers[@]}"; do
+      local pid
+      pid="$("${DOCKER_BIN}" inspect --format '{{.State.Pid}}' "${name}" 2>/dev/null || true)"
+      [[ -n "${pid}" && "${pid}" =~ ^[0-9]+$ && "${pid}" != "0" ]] || continue
+
+      local cgroup_rel
+      cgroup_rel="$(
+        awk -F: '
+          $2 == "" { print $3; exit }
+          $2 ~ /(^|,)cpuacct(,|$)/ { print $3; exit }
+        ' "/proc/${pid}/cgroup" 2>/dev/null || true
+      )"
+      [[ -n "${cgroup_rel}" ]] || continue
+
+      local usage_ns=""
+      if [[ -f "/sys/fs/cgroup${cgroup_rel}/cpu.stat" ]]; then
+        local usage_usec
+        usage_usec="$(awk '$1 == "usage_usec" { print $2; exit }' "/sys/fs/cgroup${cgroup_rel}/cpu.stat" 2>/dev/null || true)"
+        if [[ -n "${usage_usec}" && "${usage_usec}" =~ ^[0-9]+$ ]]; then
+          usage_ns="$((usage_usec * 1000))"
         fi
-      done <<<"${stats_output}"
-    fi
-    sleep "${CPU_SAMPLE_INTERVAL_SEC}"
+      elif [[ -f "/sys/fs/cgroup/cpuacct${cgroup_rel}/cpuacct.usage" ]]; then
+        usage_ns="$(tr -d '[:space:]' <"/sys/fs/cgroup/cpuacct${cgroup_rel}/cpuacct.usage" 2>/dev/null || true)"
+      fi
+      [[ -n "${usage_ns}" && "${usage_ns}" =~ ^[0-9]+$ ]] || continue
+
+      local state_file="${output_file}.${name}.state"
+      if [[ -f "${state_file}" ]]; then
+        local prev_ns prev_time_ns
+        IFS=, read -r prev_ns prev_time_ns <"${state_file}" || true
+        if [[ "${prev_ns:-}" =~ ^[0-9]+$ && "${prev_time_ns:-}" =~ ^[0-9]+$ && "${now_ns}" -gt "${prev_time_ns}" ]]; then
+          awk -v name="${name}" -v curr="${usage_ns}" -v prev="${prev_ns}" -v now="${now_ns}" -v then="${prev_time_ns}" '
+            BEGIN {
+              cpu = ((curr - prev) * 100.0) / (now - then);
+              if (cpu < 0) {
+                cpu = 0;
+              }
+              printf "%s,%.2f\n", name, cpu;
+            }
+          ' >>"${output_file}"
+        fi
+      fi
+      printf '%s,%s\n' "${usage_ns}" "${now_ns}" >"${state_file}"
+    done
+    sleep "${interval}"
   done
+
+  rm -f "${output_file}".*.state
 }
 
 cpu_stats_for_container() {
   local file="$1"
   local container="$2"
-  awk -F, -v container="${container}" '
-    $1 == container {
-      value = $2 + 0;
-      sum += value;
-      count += 1;
-      if (count == 1 || value > max) {
-        max = value;
-      }
-    }
-    END {
-      if (count == 0) {
-        printf "n/a,n/a";
-      } else {
-        printf "%.2f,%.2f", sum / count, max;
-      }
-    }
-  ' "${file}"
+  mapfile -t samples < <(awk -F, -v container="${container}" '$1 == container { print $2 }' "${file}" | sort -n)
+  local count="${#samples[@]}"
+  if [[ "${count}" -eq 0 ]]; then
+    printf 'n/a,n/a'
+    return 0
+  fi
+
+  local p50_index=$(( (50 * count + 99) / 100 - 1 ))
+  local p99_index=$(( (99 * count + 99) / 100 - 1 ))
+  printf '%.2f,%.2f' "${samples[${p50_index}]}" "${samples[${p99_index}]}"
 }
 
-echo "protocol,pps_mode,pps_value,sent_messages,echoed_messages,sent_bytes,echoed_bytes,latency_p50_ms,latency_p75_ms,latency_p99_ms,server_cpu_avg_pct,server_cpu_max_pct,client_cpu_avg_pct,client_cpu_max_pct"
+echo "protocol,pps_mode,pps_value,sent_messages,echoed_messages,sent_bytes,echoed_bytes,latency_p50_ms,latency_p75_ms,latency_p99_ms,server_cpu_p50_pct,server_cpu_p99_pct,client_cpu_p50_pct,client_cpu_p99_pct"
 
 for protocol in ${PROTOCOLS}; do
   for pps in ${PPS_VALUES}; do
@@ -240,19 +275,19 @@ for protocol in ${PROTOCOLS}; do
     summary="$(grep '^client summary:' "${client_log}" | tail -1 || true)"
     cpu_server="$(cpu_stats_for_container "${cpu_log}" pps-server)"
     cpu_client="$(cpu_stats_for_container "${cpu_log}" pps-client)"
-    cpu_server_avg="${cpu_server%,*}"
-    cpu_server_max="${cpu_server#*,}"
-    cpu_client_avg="${cpu_client%,*}"
-    cpu_client_max="${cpu_client#*,}"
+    cpu_server_p50="${cpu_server%,*}"
+    cpu_server_p99="${cpu_server#*,}"
+    cpu_client_p50="${cpu_client%,*}"
+    cpu_client_p99="${cpu_client#*,}"
     if [[ -z "${summary}" ]]; then
-      echo "${protocol},${PPS_MODE},${pps},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,${cpu_server_avg},${cpu_server_max},${cpu_client_avg},${cpu_client_max}"
+      echo "${protocol},${PPS_MODE},${pps},ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,ERROR,${cpu_server_p50},${cpu_server_p99},${cpu_client_p50},${cpu_client_p99}"
       continue
     fi
     summary="${summary#client summary: }"
     if ! csv_fields="$(summary_to_csv "${summary}")"; then
-      echo "${protocol},${PPS_MODE},${pps},PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,${cpu_server_avg},${cpu_server_max},${cpu_client_avg},${cpu_client_max}"
+      echo "${protocol},${PPS_MODE},${pps},PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,PARSE_ERROR,${cpu_server_p50},${cpu_server_p99},${cpu_client_p50},${cpu_client_p99}"
       continue
     fi
-    echo "${protocol},${PPS_MODE},${pps},${csv_fields},${cpu_server_avg},${cpu_server_max},${cpu_client_avg},${cpu_client_max}"
+    echo "${protocol},${PPS_MODE},${pps},${csv_fields},${cpu_server_p50},${cpu_server_p99},${cpu_client_p50},${cpu_client_p99}"
   done
 done
