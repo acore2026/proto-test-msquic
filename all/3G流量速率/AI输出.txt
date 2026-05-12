@@ -1,0 +1,80 @@
+$ python3 run_multi_tests.py
+============================================================
+Running 10 tests per protocol (duration: 5s each)
+============================================================
+--- Test 1/10 ---
+[SCTP] Running test 1...
+  Client: 0.170 Gbps, Server: 0.070 Gbps
+[QUIC] Running test 1...
+  Client: 0.130 Gbps, Server: 0.130 Gbps
+--- Test 2/10 ---
+[SCTP] Running test 2...
+  Client: 0.140 Gbps, Server: 0.060 Gbps
+[QUIC] Running test 2...
+  Client: 0.140 Gbps, Server: 0.130 Gbps
+--- Test 3/10 ---
+[SCTP] Running test 3...
+  Client: 0.180 Gbps, Server: 0.080 Gbps
+[QUIC] Running test 3...
+  Client: 0.130 Gbps, Server: 0.130 Gbps
+--- Test 4/10 ---
+[SCTP] Running test 4...
+  Client: 0.220 Gbps, Server: 0.090 Gbps
+[QUIC] Running test 4...
+  Client: 0.140 Gbps, Server: 0.130 Gbps
+--- Test 5/10 ---
+[SCTP] Running test 5...
+  Client: 0.360 Gbps, Server: 0.150 Gbps
+[QUIC] Running test 5...
+  Client: 0.130 Gbps, Server: 0.130 Gbps
+--- Test 6/10 ---
+[SCTP] Running test 6...
+  Client: 0.190 Gbps, Server: 0.080 Gbps
+[QUIC] Running test 6...
+  Client: 0.130 Gbps, Server: 0.130 Gbps
+--- Test 7/10 ---
+[SCTP] Running test 7...
+  Client: 0.070 Gbps, Server: 0.030 Gbps
+[QUIC] Running test 7...
+  Client: 0.130 Gbps, Server: 0.130 Gbps
+--- Test 8/10 ---
+[SCTP] Running test 8...
+  Client: 0.240 Gbps, Server: 0.100 Gbps
+[QUIC] Running test 8...
+  Client: 0.140 Gbps, Server: 0.130 Gbps
+--- Test 9/10 ---
+[SCTP] Running test 9...
+  Client: 0.380 Gbps, Server: 0.160 Gbps
+[QUIC] Running test 9...
+  Client: 0.130 Gbps, Server: 0.130 Gbps
+--- Test 10/10 ---
+[SCTP] Running test 10...
+  Client: 0.070 Gbps, Server: 0.030 Gbps
+[QUIC] Running test 10...
+  Client: 0.130 Gbps, Server: 0.130 Gbps
+============================================================
+Results Summary
+============================================================
+SCTP Client Average: 0.202 Gbps
+SCTP Server Average: 0.085 Gbps
+QUIC Client Average: 0.133 Gbps
+QUIC Server Average: 0.130 Gbps
+Chart saved to: /home/lw/proto-test-latest-2/results/performance_comparison.png
+Data saved to: /home/lw/proto-test-latest-2/results/test_data.txt
+Click to collapse
+Thinking: 测试完成了，已经生成了图表。让我查看一下生成的数据文件，确认图表已经正确生成。
+→ Read results/test_data.txt 
+→ Read results/performance_comparison.png 
+Thinking: 测试完成并已生成结果。我来总结一下结果：
+SCTP:
+- Client 平均: 0.202 Gbps
+- Server 平均: 0.085 Gbps
+QUIC:
+- Client 平均: 0.133 Gbps
+- Server 平均: 0.130 Gbps
+图表已保存在 results/performance_comparison.png
+测试完成！10次测试结果汇总：
+协议	Client 平均
+SCTP	0.202 Gbps
+QUIC	0.133 Gbps
+图表已保存至 results/performance_comparison.png，数据保存在 results/test_data.txt

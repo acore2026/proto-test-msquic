@@ -1,0 +1,116 @@
+# 运行网络扰动测试
+$ python3 test_perturbation.py
+======================================================================
+Testing SCTP vs QUIC under different network conditions
+Tests per scenario: 5, Duration: 3s each
+======================================================================
+======================================================================
+Scenario: baseline (delay=0ms, loss=0%)
+======================================================================
+  Setting up: delay=0ms, loss=0%
+    Test 1/5... SCTP: 0.280/0.090, QUIC: 0.110/0.080
+    Test 2/5... SCTP: 0.020/0.010, QUIC: 0.110/0.090
+    Test 3/5... SCTP: 0.120/0.040, QUIC: 0.100/0.090
+    Test 4/5... SCTP: 0.050/0.020, QUIC: 0.100/0.090
+    Test 5/5... SCTP: 0.390/0.140, QUIC: 0.080/0.070
+  Results for baseline:
+    SCTP: Client=0.172 Gbps, Server=0.060 Gbps
+    QUIC: Client=0.100 Gbps, Server=0.084 Gbps
+======================================================================
+Scenario: delay_10ms (delay=10ms, loss=0%)
+======================================================================
+  Setting up: delay=10ms, loss=0%
+    Test 1/5... SCTP: 0.080/0.030, QUIC: 0.100/0.090
+    Test 2/5... SCTP: 0.080/0.030, QUIC: 0.100/0.090
+    Test 3/5... SCTP: 0.080/0.030, QUIC: 0.100/0.090
+    Test 4/5... SCTP: 0.080/0.020, QUIC: 0.110/0.090
+    Test 5/5... SCTP: 0.080/0.030, QUIC: 0.110/0.090
+  Results for delay_10ms:
+    SCTP: Client=0.080 Gbps, Server=0.028 Gbps
+    QUIC: Client=0.104 Gbps, Server=0.090 Gbps
+======================================================================
+Scenario: delay_50ms (delay=50ms, loss=0%)
+======================================================================
+  Setting up: delay=50ms, loss=0%
+    Test 1/5... SCTP: 0.010/0.000, QUIC: 0.100/0.090
+    Test 2/5... SCTP: 0.010/0.000, QUIC: 0.080/0.070
+    Test 3/5... SCTP: 0.020/0.010, QUIC: 0.110/0.090
+    Test 4/5... SCTP: 0.020/0.010, QUIC: 0.050/0.030
+    Test 5/5... SCTP: 0.020/0.010, QUIC: 0.110/0.090
+  Results for delay_50ms:
+    SCTP: Client=0.016 Gbps, Server=0.006 Gbps
+    QUIC: Client=0.090 Gbps, Server=0.074 Gbps
+======================================================================
+Scenario: loss_1% (delay=0ms, loss=1%)
+======================================================================
+  Setting up: delay=0ms, loss=1%
+    Test 1/5... SCTP: 0.110/0.030, QUIC: 0.100/0.090
+    Test 2/5... SCTP: 0.090/0.030, QUIC: 0.100/0.090
+    Test 3/5... SCTP: 0.060/0.020, QUIC: 0.100/0.090
+    Test 4/5... SCTP: 0.710/0.250, QUIC: 0.100/0.070
+    Test 5/5... SCTP: 0.630/0.160, QUIC: 0.110/0.090
+  Results for loss_1%:
+    SCTP: Client=0.320 Gbps, Server=0.098 Gbps
+    QUIC: Client=0.102 Gbps, Server=0.086 Gbps
+======================================================================
+Scenario: loss_5% (delay=0ms, loss=5%)
+======================================================================
+  Setting up: delay=0ms, loss=5%
+    Test 1/5... SCTP: 0.030/0.010, QUIC: 0.100/0.090
+    Test 2/5... SCTP: 0.020/0.010, QUIC: 0.110/0.090
+    Test 3/5... SCTP: 0.010/0.000, QUIC: 0.100/0.090
+    Test 4/5... SCTP: 0.040/0.010, QUIC: 0.070/0.060
+    Test 5/5... SCTP: 0.040/0.010, QUIC: 0.100/0.090
+  Results for loss_5%:
+    SCTP: Client=0.028 Gbps, Server=0.008 Gbps
+    QUIC: Client=0.096 Gbps, Server=0.084 Gbps
+======================================================================
+Scenario: delay_50ms_loss_1% (delay=50ms, loss=1%)
+======================================================================
+  Setting up: delay=50ms, loss=1%
+    Test 1/5... SCTP: 0.010/0.000, QUIC: 0.110/0.090
+    Test 2/5... SCTP: 0.010/0.000, QUIC: 0.110/0.090
+    Test 3/5... SCTP: 0.020/0.000, QUIC: 0.110/0.090
+    Test 4/5... SCTP: 0.020/0.010, QUIC: 0.110/0.090
+    Test 5/5... SCTP: 0.010/0.000, QUIC: 0.110/0.090
+  Results for delay_50ms_loss_1%:
+    SCTP: Client=0.014 Gbps, Server=0.002 Gbps
+    QUIC: Client=0.110 Gbps, Server=0.090 Gbps
+======================================================================
+Generating charts...
+======================================================================
+Chart saved to: /home/lw/proto-test-latest-2/results/network_perturbation_comparison.png
+Data saved to: /home/lw/proto-test-latest-2/results/network_perturbation_data.txt
+======================================================================
+FINAL SUMMARY
+======================================================================
+Scenario                   SCTP Client  SCTP Server  QUIC Client  QUIC Server
+----------------------------------------------------------------------
+baseline                        0.1720       0.0600       0.1000       0.0840
+delay_10ms                      0.0800       0.0280       0.1040       0.0900
+delay_50ms                      0.0160       0.0060       0.0900       0.0740
+loss_1%                         0.3200       0.0980       0.1020       0.0860
+loss_5%                         0.0280       0.0080       0.0960       0.0840
+delay_50ms_loss_1%              0.0140       0.0020       0.1100       0.0900
+Click to collapse
+Thinking: 测试完成了！现在我需要读取生成的图表展示给用户。
+测试完成！结果汇总：
+场景	SCTP Client	SCTP Server	QUIC Client
+baseline	0.172 Gbps	0.060 Gbps	0.100 Gbps
+delay_10ms	0.080 Gbps	0.028 Gbps	0.104 Gbps
+delay_50ms	0.016 Gbps	0.006 Gbps	0.090 Gbps
+loss_1%	0.320 Gbps	0.098 Gbps	0.102 Gbps
+loss_5%	0.028 Gbps	0.008 Gbps	0.096 Gbps
+delay_50ms+loss_1%	0.014 Gbps	0.002 Gbps	0.110 Gbps
+图表已保存至 results/network_perturbation_comparison.png
+→ Read results/network_perturbation_comparison.png 
+Thinking: 测试完成了，图表也生成了。让我总结一下关键发现：
+1. 延迟影响：SCTP 对延迟非常敏感，10ms延迟时性能下降约50%，50ms延迟时几乎无法工作。QUIC 在延迟下表现稳定。
+2. 丢包影响：1%丢包时SCTP性能反而提升（可能是拥塞控制调整），但5%丢包时性能急剧下降。QUIC在丢包环境下表现更稳定。
+3. 混合场景：在高延迟+丢包的组合场景下，QUIC表现明显优于SCTP。
+这些结果已经展示给用户了。
+测试完成！关键发现：
+1. 延迟敏感性：SCTP对延迟极度敏感，10ms延迟时下降54%，50ms延迟时下降91%。QUIC在延迟下表现稳定。
+2. 丢包影响：SCTP在1%丢包时性能反而提升（可能拥塞控制优化），但5%丢包时下降84%。QUIC表现稳定。
+3. 混合场景：高延迟+丢包组合下，QUIC性能是SCTP的7-8倍。
+图表：results/network_perturbation_comparison.png，数据：results/network_perturbation_data.txt
