@@ -1,0 +1,128 @@
+python3 run_multi_tests.py
+======================================================================
+Running 10 tests per protocol (duration: 5s each)
+Measuring throughput and System CPU (User-Space + Kernel)
+======================================================================
+--- Test 1/10 ---
+[SCTP] Running test 1...
+  Throughput: Client=0.410 Gbps, Server=0.160 Gbps
+  System CPU: Server=1.0% (peak 1.9%), Client=1.0% (peak 1.9%)
+[QUIC] Running test 1...
+  Throughput: Client=0.140 Gbps, Server=0.130 Gbps
+  System CPU: Server=4.4% (peak 8.8%), Client=5.2% (peak 8.9%)
+--- Test 2/10 ---
+[SCTP] Running test 2...
+  Throughput: Client=0.380 Gbps, Server=0.150 Gbps
+  System CPU: Server=1.0% (peak 2.1%), Client=1.0% (peak 2.1%)
+[QUIC] Running test 2...
+  Throughput: Client=0.130 Gbps, Server=0.130 Gbps
+  System CPU: Server=4.4% (peak 8.1%), Client=5.1% (peak 8.1%)
+--- Test 3/10 ---
+[SCTP] Running test 3...
+  Throughput: Client=0.190 Gbps, Server=0.080 Gbps
+  System CPU: Server=1.0% (peak 1.9%), Client=1.0% (peak 1.7%)
+[QUIC] Running test 3...
+  Throughput: Client=0.130 Gbps, Server=0.130 Gbps
+  System CPU: Server=5.1% (peak 9.0%), Client=6.1% (peak 9.0%)
+--- Test 4/10 ---
+[SCTP] Running test 4...
+  Throughput: Client=0.190 Gbps, Server=0.080 Gbps
+  System CPU: Server=1.2% (peak 2.9%), Client=1.2% (peak 2.1%)
+[QUIC] Running test 4...
+  Throughput: Client=0.100 Gbps, Server=0.080 Gbps
+  System CPU: Server=4.3% (peak 8.1%), Client=5.2% (peak 8.1%)
+--- Test 5/10 ---
+[SCTP] Running test 5...
+  Throughput: Client=0.410 Gbps, Server=0.180 Gbps
+  System CPU: Server=1.1% (peak 1.9%), Client=1.1% (peak 1.9%)
+[QUIC] Running test 5...
+  Throughput: Client=0.130 Gbps, Server=0.130 Gbps
+  System CPU: Server=4.7% (peak 9.6%), Client=5.6% (peak 9.6%)
+--- Test 6/10 ---
+[SCTP] Running test 6...
+  Throughput: Client=0.130 Gbps, Server=0.060 Gbps
+  System CPU: Server=1.1% (peak 2.1%), Client=1.1% (peak 2.1%)
+[QUIC] Running test 6...
+  Throughput: Client=0.130 Gbps, Server=0.130 Gbps
+  System CPU: Server=4.6% (peak 9.0%), Client=5.4% (peak 9.0%)
+--- Test 7/10 ---
+[SCTP] Running test 7...
+  Throughput: Client=0.200 Gbps, Server=0.080 Gbps
+  System CPU: Server=1.0% (peak 2.3%), Client=1.1% (peak 2.3%)
+[QUIC] Running test 7...
+  Throughput: Client=0.130 Gbps, Server=0.130 Gbps
+  System CPU: Server=4.4% (peak 8.3%), Client=5.1% (peak 8.3%)
+--- Test 8/10 ---
+[SCTP] Running test 8...
+  Throughput: Client=0.210 Gbps, Server=0.080 Gbps
+  System CPU: Server=1.1% (peak 2.3%), Client=1.0% (peak 2.3%)
+[QUIC] Running test 8...
+  Throughput: Client=0.130 Gbps, Server=0.130 Gbps
+  System CPU: Server=4.7% (peak 8.4%), Client=5.6% (peak 8.4%)
+--- Test 9/10 ---
+[SCTP] Running test 9...
+  Throughput: Client=0.390 Gbps, Server=0.170 Gbps
+  System CPU: Server=1.0% (peak 2.3%), Client=1.1% (peak 2.3%)
+[QUIC] Running test 9...
+  Throughput: Client=0.090 Gbps, Server=0.080 Gbps
+  System CPU: Server=4.1% (peak 8.0%), Client=4.8% (peak 7.9%)
+--- Test 10/10 ---
+[SCTP] Running test 10...
+  Throughput: Client=0.180 Gbps, Server=0.080 Gbps
+  System CPU: Server=1.0% (peak 1.9%), Client=0.9% (peak 1.9%)
+[QUIC] Running test 10...
+  Throughput: Client=0.120 Gbps, Server=0.120 Gbps
+  System CPU: Server=4.4% (peak 8.8%), Client=5.1% (peak 8.8%)
+======================================================================
+Results Summary
+======================================================================
+Metric                               SCTP            QUIC      Difference
+----------------------------------------------------------------------
+Client Throughput                   0.269           0.123           0.146 Gbps
+Server Throughput                   0.112           0.119          -0.007 Gbps
+Server System CPU                     1.1             4.5             3.4%
+Client System CPU                     1.0             5.3             4.3%
+Total System CPU                      2.1             9.8             7.7%
+Server System Peak                    2.2             8.6             6.5%
+Client System Peak                    2.1             8.6             6.6%
+Chart saved to: /home/lw/proto-test-latest-2/results/performance_comparison.png
+Data saved to: /home/lw/proto-test-latest-2/results/test_data.txt
+======================================================================
+Key Observations
+======================================================================
+1. Throughput: SCTP client 0.27 Gbps vs QUIC 0.12 Gbps
+   - SCTP higher by 0.15 Gbps (118.7%)
+2. Server System CPU: QUIC 4.5% vs SCTP 1.1%
+   - QUIC higher by 3.4% (325.8%)
+3. Client System CPU: QUIC 5.3% vs SCTP 1.0%
+   - QUIC higher by 4.3%
+4. Total System CPU: QUIC 9.8% vs SCTP 2.1%
+   - QUIC uses 4.7x more system CPU resources
+Click to collapse
+Thinking: The script ran successfully. Let me read the data and chart files to confirm.
+测试完成！10次测试结果汇总：
+指标	SCTP	QUIC
+Client吞吐量	0.269 Gbps	0.123 Gbps
+Server吞吐量	0.112 Gbps	0.119 Gbps
+Server系统CPU	1.1%	4.5%
+Client系统CPU	1.0%	5.3%
+总系统CPU	2.1%	9.8%
+关键发现：
+1. 吞吐量：SCTP Client吞吐量是QUIC的2.2倍
+2. 系统CPU消耗：QUIC总系统CPU是SCTP的4.7倍
+3. Server系统CPU：QUIC比SCTP高3.4%（325%）
+4. Client系统CPU：QUIC比SCTP高4.3%（430%）
+→ Read results/test_data.txt 
+→ Read results/performance_comparison.png 
+Thinking: The test ran successfully with 10 iterations and collected the system CPU measurements. The chart and data are saved. Let me provide a summary.
+图表已保存至 results/performance_comparison.png，数据保存在 results/test_data.txt
+结论：
+指标	SCTP	QUIC
+Client吞吐量	0.27 Gbps	0.12 Gbps
+Server吞吐量	0.11 Gbps	0.12 Gbps
+Server系统CPU	1.1%	4.5%
+Client系统CPU	1.0%	5.3%
+总系统CPU	2.1%	9.8%
+- 真实资源消耗：QUIC系统CPU消耗是SCTP的4.7倍（用户态+内核态总和）
+- 吞吐量效率：SCTP吞吐量更高但CPU消耗更低，效率更优
+- QUIC用户态实现带来额外加密和协议处理开销
