@@ -1,0 +1,7 @@
+Scenario,Delay_ms,Loss_%,SCTP_Client_Gbps,SCTP_Server_Gbps,QUIC_Client_Gbps,QUIC_Server_Gbps
+baseline,0,0,0.1720,0.0600,0.1000,0.0840
+delay_10ms,10,0,0.0800,0.0280,0.1040,0.0900
+delay_50ms,50,0,0.0160,0.0060,0.0900,0.0740
+loss_1%,0,1,0.3200,0.0980,0.1020,0.0860
+loss_5%,0,5,0.0280,0.0080,0.0960,0.0840
+delay_50ms_loss_1%,50,1,0.0140,0.0020,0.1100,0.0900

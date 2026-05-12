@@ -1,0 +1,7 @@
+--------------------------------------------------
+QUIC Benchmark Results:
+  Duration:       10.00s
+  Streams:        1
+  Total sent:     387.51 MB
+  Throughput:     0.31 Gbps
+--------------------------------------------------

@@ -1,0 +1,7 @@
+--------------------------------------------------
+SCTP Benchmark Results (Kernel):
+  Duration:       10.31s
+  Streams:        1
+  Total sent:     326.70 MB
+  Throughput:     0.25 Gbps
+--------------------------------------------------

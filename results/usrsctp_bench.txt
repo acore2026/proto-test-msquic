@@ -1,0 +1,168 @@
+[S][0.000] Timer type 7 started: ticks=3600000, inp=0x55d3173e2470, stcb=(nil), net=(nil).
+[S][0.000] SCTP: add HMAC id 1 to list
+[S][0.000] SCTP: added chunk 193 (0xc1) to Auth list
+[S][0.000] SCTP: added chunk 128 (0x80) to Auth list
+[S][0.000] Bind called port: 0
+[S][0.000] Addr: [S][0.000] IPv4 address: 0.0.0.0:0
+[S][0.000] Main hash to bind at head:0x55d3173de168, bound port:55261 - in tcp_pool=0
+[S][0.000] Allocate an association for peer:[S][0.000] IPv4 address: 127.0.0.1:5001
+[S][0.000] Port:5001
+[S][0.000] Adding an address (from:1) to the peer: [S][0.000] IPv4 address: 127.0.0.1:5001
+[S][0.000] Association 0x55d3173f4ed0 now allocated
+[S][0.000] Sending INIT
+[S][0.000] Timer type 2 started: ticks=3000, inp=0x55d3173e2470, stcb=0x55d3173f4ed0, net=0x55d3173e4620.
+[S][0.000] Sending INIT - calls lowlevel_output
+[S][0.000] Select source addr for:[S][0.000] IPv4 address: 127.0.0.1:5001
+[S][0.000] ifn from route:(nil) ifn_index:1
+[S][0.000] ifn_index:1 name:lo is emit interface
+[S][0.000] Is destination preferred:[S][0.000] IPv4 address: 10.255.255.254:0
+[S][0.000] src_loop:1 src_priv:1 src_glob:0
+[S][0.000] dest_loop:1 dest_priv:0 dest_glob:0
+[S][0.000] YES
+[S][0.000] Is destination preferred:[S][0.000] IPv4 address: 127.0.0.1:0
+[S][0.000] src_loop:1 src_priv:0 src_glob:0
+[S][0.000] dest_loop:1 dest_priv:0 dest_glob:0
+[S][0.000] YES
+[S][0.000] Found 2 preferred source addresses for intf:lo
+[S][0.000] cur_addr_num:0
+[S][0.000] Is destination preferred:[S][0.000] IPv4 address: 10.255.255.254:0
+[S][0.000] src_loop:1 src_priv:1 src_glob:0
+[S][0.000] dest_loop:1 dest_priv:0 dest_glob:0
+[S][0.000] YES
+[S][0.000] Calling ipv4 output routine from low level src addr:afffffe
+[S][0.000] Destination is 7f000001
+[S][0.000] RTP route is 0x55d3173e48a0 through
+[S][0.000] recv_function_raw: Received 212 bytes.[S][0.000]  - calling sctp_common_input_processing with off=32
+[S][0.000] stcb:(nil) inp:(nil)
+[S][0.000] stcb is (nil)
+[S][0.000] IP output returns 0
+[S][0.000] recv_function_raw: Received 36 bytes.[S][0.000]  - calling sctp_common_input_processing with off=32
+[S][0.000] Bad CSUM on SCTP packet calc_check:48f94ceb check:0  m:0x70a308000f80 mlen:36 iphlen:20
+[S][3.062] Timer type 2 goes off.
+[S][3.062] Error count for 0x55d3173e4620 now 1 thresh:5
+[S][3.062] Overall error count for 0x55d3173f4f28 now 1 thresh:8 state:1
+[S][3.062] Sending INIT
+[S][3.062] Timer type 2 started: ticks=6000, inp=0x55d3173e2470, stcb=0x55d3173f4ed0, net=0x55d3173e4620.
+[S][3.062] Sending INIT - calls lowlevel_output
+[S][3.062] Calling ipv4 output routine from low level src addr:afffffe
+[S][3.062] Destination is 7f000001
+[S][3.062] RTP route is 0x55d3173e48a0 through
+[S][3.062] IP output returns 0
+[S][3.062] recv_function_raw: Received 212 bytes.[S][3.062]  - calling sctp_common_input_processing with off=32
+[S][3.062] stcb:(nil) inp:(nil)
+[S][3.062] Timer type 2 handler finished.
+[S][3.062] stcb is (nil)
+[S][3.062] recv_function_raw: Received 36 bytes.[S][3.062]  - calling sctp_common_input_processing with off=32
+[S][3.062] Bad CSUM on SCTP packet calc_check:48f94ceb check:0  m:0x70a308000f80 mlen:36 iphlen:20
+[S][9.135] Timer type 2 goes off.
+[S][9.135] Error count for 0x55d3173e4620 now 2 thresh:5
+[S][9.136] Overall error count for 0x55d3173f4f28 now 2 thresh:8 state:1
+[S][9.136] Sending INIT
+[S][9.136] Timer type 2 started: ticks=12000, inp=0x55d3173e2470, stcb=0x55d3173f4ed0, net=0x55d3173e4620.
+[S][9.136] Sending INIT - calls lowlevel_output
+[S][9.136] Calling ipv4 output routine from low level src addr:afffffe
+[S][9.136] Destination is 7f000001
+[S][9.136] RTP route is 0x55d3173e48a0 through
+[S][9.136] IP output returns 0
+[S][9.136] Timer type 2 handler finished.
+[S][9.136] recv_function_raw: Received 212 bytes.[S][9.136]  - calling sctp_common_input_processing with off=32
+[S][9.136] stcb:(nil) inp:(nil)
+[S][9.136] stcb is (nil)
+[S][9.136] recv_function_raw: Received 36 bytes.[S][9.136]  - calling sctp_common_input_processing with off=32
+[S][9.136] Bad CSUM on SCTP packet calc_check:48f94ceb check:0  m:0x70a308000f80 mlen:36 iphlen:20
+[S][21.233] Timer type 2 goes off.
+[S][21.233] Error count for 0x55d3173e4620 now 3 thresh:5
+[S][21.233] Overall error count for 0x55d3173f4f28 now 3 thresh:8 state:1
+[S][21.233] Sending INIT
+[S][21.233] Timer type 2 started: ticks=24000, inp=0x55d3173e2470, stcb=0x55d3173f4ed0, net=0x55d3173e4620.
+[S][21.233] Sending INIT - calls lowlevel_output
+[S][21.233] Calling ipv4 output routine from low level src addr:afffffe
+[S][21.233] Destination is 7f000001
+[S][21.233] RTP route is 0x55d3173e48a0 through
+[S][21.233] IP output returns 0
+[S][21.233] Timer type 2 handler finished.
+[S][21.233] recv_function_raw: Received 212 bytes.[S][21.233]  - calling sctp_common_input_processing with off=32
+[S][21.233] stcb:(nil) inp:(nil)
+[S][21.233] stcb is (nil)
+[S][21.233] recv_function_raw: Received 36 bytes.[S][21.233]  - calling sctp_common_input_processing with off=32
+[S][21.233] Bad CSUM on SCTP packet calc_check:48f94ceb check:0  m:0x70a308000f80 mlen:36 iphlen:20
+[S][45.426] Timer type 2 goes off.
+[S][45.426] Error count for 0x55d3173e4620 now 4 thresh:5
+[S][45.426] Overall error count for 0x55d3173f4f28 now 4 thresh:8 state:1
+[S][45.426] Sending INIT
+[S][45.426] Timer type 2 started: ticks=48000, inp=0x55d3173e2470, stcb=0x55d3173f4ed0, net=0x55d3173e4620.
+[S][45.426] Sending INIT - calls lowlevel_output
+[S][45.426] Calling ipv4 output routine from low level src addr:afffffe
+[S][45.426] Destination is 7f000001
+[S][45.426] RTP route is 0x55d3173e48a0 through
+[S][45.426] IP output returns 0
+[S][45.426] Timer type 2 handler finished.
+[S][45.426] recv_function_raw: Received 212 bytes.[S][45.426]  - calling sctp_common_input_processing with off=32
+[S][45.426] stcb:(nil) inp:(nil)
+[S][45.426] stcb is (nil)
+[S][45.426] recv_function_raw: Received 36 bytes.[S][45.426]  - calling sctp_common_input_processing with off=32
+[S][45.426] Bad CSUM on SCTP packet calc_check:48f94ceb check:0  m:0x70a308000f80 mlen:36 iphlen:20
+[S][93.945] Timer type 2 goes off.
+[S][93.945] Error count for 0x55d3173e4620 now 5 thresh:5
+[S][93.945] Overall error count for 0x55d3173f4f28 now 5 thresh:8 state:1
+[S][93.945] Sending INIT
+[S][93.945] Timer type 2 started: ticks=60000, inp=0x55d3173e2470, stcb=0x55d3173f4ed0, net=0x55d3173e4620.
+[S][93.945] Sending INIT - calls lowlevel_output
+[S][93.945] Calling ipv4 output routine from low level src addr:afffffe
+[S][93.945] Destination is 7f000001
+[S][93.945] RTP route is 0x55d3173e48a0 through
+[S][93.945] IP output returns 0
+[S][93.945] Timer type 2 handler finished.
+[S][93.945] recv_function_raw: Received 212 bytes.[S][93.945]  - calling sctp_common_input_processing with off=32
+[S][93.945] stcb:(nil) inp:(nil)
+[S][93.945] stcb is (nil)
+[S][93.945] recv_function_raw: Received 36 bytes.[S][93.945]  - calling sctp_common_input_processing with off=32
+[S][93.945] Bad CSUM on SCTP packet calc_check:48f94ceb check:0  m:0x70a308000f80 mlen:36 iphlen:20
+[S][154.658] Timer type 2 goes off.
+[S][154.658] Error count for 0x55d3173e4620 now 6 thresh:5
+[S][154.658] Overall error count for 0x55d3173f4f28 now 6 thresh:8 state:0
+[S][154.658] Sending INIT
+[S][154.658] Timer type 2 started: ticks=60000, inp=0x55d3173e2470, stcb=0x55d3173f4ed0, net=0x55d3173e4620.
+[S][154.658] Sending INIT - calls lowlevel_output
+[S][154.658] Calling ipv4 output routine from low level src addr:afffffe
+[S][154.658] Destination is 7f000001
+[S][154.658] RTP route is 0x55d3173e48a0 through
+[S][154.658] recv_function_raw: Received 212 bytes.[S][154.658]  - calling sctp_common_input_processing with off=32
+[S][154.658] IP output returns 0
+[S][154.658] Timer type 2 handler finished.
+[S][154.658] stcb:(nil) inp:(nil)
+[S][154.658] stcb is (nil)
+[S][154.658] recv_function_raw: Received 36 bytes.[S][154.658]  - calling sctp_common_input_processing with off=32
+[S][154.658] Bad CSUM on SCTP packet calc_check:48f94ceb check:0  m:0x70a308000f80 mlen:36 iphlen:20
+[S][215.359] Timer type 2 goes off.
+[S][215.360] Error count for 0x55d3173e4620 now 7 thresh:5
+[S][215.360] Overall error count for 0x55d3173f4f28 now 7 thresh:8 state:0
+[S][215.360] Sending INIT
+[S][215.360] Timer type 2 started: ticks=60000, inp=0x55d3173e2470, stcb=0x55d3173f4ed0, net=0x55d3173e4620.
+[S][215.360] Sending INIT - calls lowlevel_output
+[S][215.360] Calling ipv4 output routine from low level src addr:afffffe
+[S][215.360] Destination is 7f000001
+[S][215.360] RTP route is 0x55d3173e48a0 through
+[S][215.360] recv_function_raw: Received 212 bytes.[S][215.360]  - calling sctp_common_input_processing with off=32
+[S][215.360] stcb:(nil) inp:(nil)
+[S][215.360] stcb is (nil)
+[S][215.360] IP output returns 0
+[S][215.360] Timer type 2 handler finished.
+[S][215.360] recv_function_raw: Received 36 bytes.[S][215.360]  - calling sctp_common_input_processing with off=32
+[S][215.360] Bad CSUM on SCTP packet calc_check:48f94ceb check:0  m:0x70a308000f80 mlen:36 iphlen:20
+[S][276.099] Timer type 2 goes off.
+[S][276.099] Error count for 0x55d3173e4620 now 8 thresh:5
+[S][276.099] Overall error count for 0x55d3173f4f28 now 8 thresh:8 state:0
+[S][276.099] Sending INIT
+[S][276.099] Timer type 2 started: ticks=60000, inp=0x55d3173e2470, stcb=0x55d3173f4ed0, net=0x55d3173e4620.
+[S][276.099] Sending INIT - calls lowlevel_output
+[S][276.099] Calling ipv4 output routine from low level src addr:afffffe
+[S][276.099] Destination is 7f000001
+[S][276.099] RTP route is 0x55d3173e48a0 through
+[S][276.099] IP output returns 0
+[S][276.099] recv_function_raw: Received 212 bytes.[S][276.099]  - calling sctp_common_input_processing with off=32
+[S][276.099] Timer type 2 handler finished.
+[S][276.099] stcb:(nil) inp:(nil)
+[S][276.099] stcb is (nil)
+[S][276.099] recv_function_raw: Received 36 bytes.[S][276.099]  - calling sctp_common_input_processing with off=32
+[S][276.099] Bad CSUM on SCTP packet calc_check:48f94ceb check:0  m:0x70a308000f80 mlen:36 iphlen:20
