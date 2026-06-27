@@ -1,4 +1,9 @@
+#ifdef HAVE_MSQUIC
 #include <msquic.h>
+#endif
+#ifdef HAVE_LSQUIC
+#include <lsquic.h>
+#endif
 
 #include <arpa/inet.h>
 #include <algorithm>
@@ -10,8 +15,10 @@
 #include <deque>
 #include <csignal>
 #include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <fcntl.h>
@@ -31,6 +38,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -45,6 +53,7 @@ constexpr char kDefaultAlpn[] = "msquic-load";
 
 enum class Protocol {
     MsQuic,
+    LsQuic,
     Sctp,
 };
 
@@ -52,6 +61,8 @@ std::string ProtocolName(Protocol protocol) {
     switch (protocol) {
     case Protocol::MsQuic:
         return "msquic";
+    case Protocol::LsQuic:
+        return "lsquic";
     case Protocol::Sctp:
         return "sctp";
     }
@@ -62,10 +73,13 @@ Protocol ParseProtocol(const std::string& value) {
     if (value == "msquic") {
         return Protocol::MsQuic;
     }
+    if (value == "lsquic") {
+        return Protocol::LsQuic;
+    }
     if (value == "sctp") {
         return Protocol::Sctp;
     }
-    throw std::runtime_error("unsupported protocol: " + value + " (expected msquic or sctp)");
+    throw std::runtime_error("unsupported protocol: " + value + " (expected msquic, lsquic, or sctp)");
 }
 
 std::atomic<bool> g_stop_requested{false};
@@ -79,11 +93,21 @@ uint64_t NowNs() {
         std::chrono::duration_cast<Nanoseconds>(Clock::now().time_since_epoch()).count());
 }
 
+uint64_t RealtimeNs() {
+    timespec ts{};
+    if (::clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        throw std::runtime_error(std::string("clock_gettime(CLOCK_REALTIME) failed: ") + std::strerror(errno));
+    }
+    return (static_cast<uint64_t>(ts.tv_sec) * 1'000'000'000ULL) + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+#ifdef HAVE_MSQUIC
 std::string StatusToHex(QUIC_STATUS status) {
     std::ostringstream stream;
     stream << "0x" << std::hex << static_cast<uint32_t>(status);
     return stream.str();
 }
+#endif
 
 #ifndef OPENSSL_NO_SCTP
 std::string ReadTextFile(const char* path) {
@@ -246,13 +270,17 @@ void PrintUsage() {
         << "  msquic-loadtest server [options]\n"
         << "  msquic-loadtest client --target=HOST [options]\n\n"
         << "Common options:\n"
-        << "  --protocol=msquic|sctp    Transport protocol, default msquic\n"
+        << "  --protocol=msquic|lsquic|sctp Transport protocol, default msquic\n"
         << "  --base-port=PORT           First port, default 15443\n"
         << "  --server-count=N           Number of listeners, default 1\n"
         << "  --stream-count=N           Streams per connection/association, default 1\n"
         << "  --message-size=BYTES       Fixed frame size, default 1024\n"
         << "  --idle-timeout-ms=N        Idle timeout, default 30000\n"
-        << "  --stats-interval-ms=N      Stats interval, default 1000\n\n"
+        << "  --stats-interval-ms=N      Stats interval, default 1000\n"
+        << "  --qualcomm-method=1        Enable single-client stack timing trace mode\n"
+        << "  --message-count=N          Messages to send in Qualcomm mode, default 30000\n"
+        << "  --qualcomm-gap-ms=N        Gap between Qualcomm-mode message cycles, default 0\n"
+        << "  --trace-file=FILE          App timestamp CSV for Qualcomm mode\n\n"
         << "Server options:\n"
         << "  --cert=FILE                PEM certificate (msquic, or sctp with --sctp-tls=1)\n"
         << "  --key=FILE                 PEM private key (msquic, or sctp with --sctp-tls=1)\n"
@@ -319,6 +347,10 @@ struct AppConfig {
     bool sctp_tls{false};
     std::string ca_file;
     std::vector<StreamProfile> stream_profiles;
+    bool qualcomm_method{false};
+    uint64_t message_count{30000};
+    uint64_t qualcomm_gap_ms{0};
+    std::string trace_file;
 };
 
 bool HasStreamProfilePacing(const AppConfig& config) {
@@ -382,18 +414,22 @@ std::vector<AppConfig::StreamProfile> ParseStreamProfiles(const std::string& val
 AppConfig LoadConfig(const Args& args) {
     AppConfig config;
     config.mode = args.mode;
+    config.qualcomm_method = GetBool(args, "qualcomm-method", false);
     config.protocol = ParseProtocol(GetString(args, "protocol", "msquic"));
     config.alpn = GetString(args, "alpn", kDefaultAlpn);
     config.base_port = GetNumber<uint16_t>(args, "base-port", 15443);
     config.server_count = GetNumber<uint32_t>(args, "server-count", 1);
     config.stream_count = GetNumber<uint32_t>(args, "stream-count", 1);
-    config.message_size = GetNumber<uint32_t>(args, "message-size", 1024);
+    config.message_size = GetNumber<uint32_t>(args, "message-size", config.qualcomm_method ? 50U : 1024U);
     config.idle_timeout_ms = GetNumber<uint64_t>(args, "idle-timeout-ms", 30000);
-    config.stats_interval_ms = GetNumber<uint64_t>(args, "stats-interval-ms", 1000);
+    config.stats_interval_ms = GetNumber<uint64_t>(args, "stats-interval-ms", config.qualcomm_method ? 0U : 1000U);
     config.sctp_nodelay = GetBool(args, "sctp-nodelay", true);
     config.sctp_stream_id = GetNumber<uint16_t>(args, "sctp-stream-id", 0);
     config.sctp_tls = GetBool(args, "sctp-tls", false);
     config.ca_file = GetString(args, "ca", "");
+    config.message_count = GetNumber<uint64_t>(args, "message-count", 30000);
+    config.qualcomm_gap_ms = GetNumber<uint64_t>(args, "qualcomm-gap-ms", 0);
+    config.trace_file = GetString(args, "trace-file", "");
     const auto stream_profile_arg = FindArg(args, "stream-profile");
     if (stream_profile_arg.has_value()) {
         config.stream_profiles = ParseStreamProfiles(*stream_profile_arg);
@@ -412,10 +448,30 @@ AppConfig LoadConfig(const Args& args) {
     if (config.protocol == Protocol::Sctp && config.sctp_tls && config.stream_count > 1) {
         throw std::runtime_error("SCTP multi-stream is not supported with --sctp-tls=1 yet");
     }
+    if (config.qualcomm_method) {
+        if (config.server_count != 1) {
+            throw std::runtime_error("--qualcomm-method=1 requires --server-count=1");
+        }
+        if (config.stream_count != 1) {
+            throw std::runtime_error("--qualcomm-method=1 requires --stream-count=1");
+        }
+        if (config.message_size != 50) {
+            throw std::runtime_error("--qualcomm-method=1 requires --message-size=50");
+        }
+        if (config.message_count == 0) {
+            throw std::runtime_error("--message-count must be >= 1 in Qualcomm mode");
+        }
+        if (!config.stream_profiles.empty()) {
+            throw std::runtime_error("--qualcomm-method=1 cannot be combined with --stream-profile");
+        }
+        if (config.trace_file.empty()) {
+            throw std::runtime_error("--qualcomm-method=1 requires --trace-file=FILE");
+        }
+    }
 
     if (config.mode == "server") {
         config.bind = GetString(args, "bind", "0.0.0.0");
-        if (config.protocol == Protocol::MsQuic) {
+        if (config.protocol == Protocol::MsQuic || config.protocol == Protocol::LsQuic) {
             config.cert_file = GetRequired(args, "cert");
             config.key_file = GetRequired(args, "key");
             config.password = GetString(args, "password", "");
@@ -451,6 +507,17 @@ AppConfig LoadConfig(const Args& args) {
         }
         if (!config.stream_profiles.empty() && (config.send_pps > 0 || config.send_pps_per_client > 0)) {
             throw std::runtime_error("use --stream-profile send rates instead of --send-pps/--send-pps-per-client");
+        }
+        if (config.qualcomm_method) {
+            if (config.client_count != 1) {
+                throw std::runtime_error("--qualcomm-method=1 requires --clients=1");
+            }
+            if (config.max_inflight != 1) {
+                throw std::runtime_error("--qualcomm-method=1 requires --max-inflight=1");
+            }
+            if (config.send_pps != 0 || config.send_pps_per_client != 0) {
+                throw std::runtime_error("--qualcomm-method=1 bypasses app pacing; do not set --send-pps or --send-pps-per-client");
+            }
         }
     } else {
         throw std::runtime_error("mode must be 'server' or 'client'");
@@ -529,6 +596,76 @@ AppConfig::StreamProfile StreamProfileForOrdinal(const AppConfig& config, uint32
     return config.stream_profiles.at(ordinal);
 }
 
+constexpr size_t kQualcommHopOffset = sizeof(MessageHeader);
+constexpr uint8_t kQualcommHopInitial = 0;
+constexpr uint8_t kQualcommHopReflected = 1;
+constexpr uint8_t kQualcommHopFinal = 2;
+
+uint8_t QualcommHop(const std::vector<uint8_t>& frame) {
+    return frame.size() > kQualcommHopOffset ? frame[kQualcommHopOffset] : 0xff;
+}
+
+void SetQualcommHop(std::vector<uint8_t>& frame, uint8_t hop) {
+    if (frame.size() <= kQualcommHopOffset) {
+        throw std::runtime_error("Qualcomm mode frame is too small for hop marker");
+    }
+    frame[kQualcommHopOffset] = hop;
+}
+
+class QualcommTraceWriter {
+  public:
+    QualcommTraceWriter(const AppConfig& config, std::string role)
+        : enabled_(config.qualcomm_method),
+          role_(std::move(role)),
+          protocol_(ProtocolName(config.protocol)) {
+        if (!enabled_) {
+            return;
+        }
+        output_.open(config.trace_file, std::ios::out | std::ios::trunc);
+        if (!output_) {
+            throw std::runtime_error("failed to open trace file: " + config.trace_file);
+        }
+        output_ << "event,role,protocol,sequence,message_size,hop_in,hop_out,"
+                << "app_entry_realtime_ns,app_exit_realtime_ns,app_entry_mono_ns,app_exit_mono_ns\n";
+    }
+
+    void Log(
+        const char* event,
+        uint64_t sequence,
+        uint32_t message_size,
+        uint8_t hop_in,
+        uint8_t hop_out,
+        uint64_t entry_realtime_ns,
+        uint64_t exit_realtime_ns,
+        uint64_t entry_mono_ns,
+        uint64_t exit_mono_ns) {
+        if (!enabled_) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        output_ << event << ','
+                << role_ << ','
+                << protocol_ << ','
+                << sequence << ','
+                << message_size << ','
+                << static_cast<uint32_t>(hop_in) << ','
+                << static_cast<uint32_t>(hop_out) << ','
+                << entry_realtime_ns << ','
+                << exit_realtime_ns << ','
+                << entry_mono_ns << ','
+                << exit_mono_ns << '\n';
+        output_.flush();
+    }
+
+  private:
+    bool enabled_{false};
+    std::string role_;
+    std::string protocol_;
+    std::mutex mutex_;
+    std::ofstream output_;
+};
+
+#ifdef HAVE_MSQUIC
 struct SendBuffer {
     QUIC_BUFFER quic_buffer{};
     std::vector<uint8_t> storage;
@@ -538,6 +675,7 @@ struct SendBuffer {
         quic_buffer.Length = static_cast<uint32_t>(storage.size());
     }
 };
+#endif
 
 class Stats {
   public:
@@ -778,6 +916,9 @@ class StatsPrinter {
         : name_(std::move(name)), stats_(stats), interval_ms_(interval_ms) {}
 
     void Start() {
+        if (interval_ms_ == 0) {
+            return;
+        }
         worker_ = std::thread([this]() { Run(); });
     }
 
@@ -839,6 +980,36 @@ std::string OpenSslErrorString(const char* action) {
         first = false;
     }
     return stream.str();
+}
+
+int SslReadCompat(SSL* ssl, void* buffer, size_t length, size_t* read) {
+#ifdef HAVE_LSQUIC
+    const int capped = static_cast<int>(std::min<size_t>(length, static_cast<size_t>(INT_MAX)));
+    const int rc = SSL_read(ssl, buffer, capped);
+    if (rc > 0) {
+        *read = static_cast<size_t>(rc);
+        return 1;
+    }
+    *read = 0;
+    return rc;
+#else
+    return SSL_read_ex(ssl, buffer, length, read);
+#endif
+}
+
+int SslWriteCompat(SSL* ssl, const void* buffer, size_t length, size_t* written) {
+#ifdef HAVE_LSQUIC
+    const int capped = static_cast<int>(std::min<size_t>(length, static_cast<size_t>(INT_MAX)));
+    const int rc = SSL_write(ssl, buffer, capped);
+    if (rc > 0) {
+        *written = static_cast<size_t>(rc);
+        return 1;
+    }
+    *written = 0;
+    return rc;
+#else
+    return SSL_write_ex(ssl, buffer, length, written);
+#endif
 }
 
 #ifndef OPENSSL_NO_SCTP
@@ -1120,7 +1291,7 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
             int ssl_error = 0;
             {
                 std::lock_guard<std::mutex> lock(ssl_mutex_);
-                ok = SSL_read_ex(ssl_, poll_buffer_.data(), poll_buffer_.size(), &read);
+                ok = SslReadCompat(ssl_, poll_buffer_.data(), poll_buffer_.size(), &read);
                 if (ok != 1) {
                     ssl_error = SSL_get_error(ssl_, ok);
                 }
@@ -1186,7 +1357,7 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
                 int ssl_error = 0;
                 {
                     std::lock_guard<std::mutex> lock(ssl_mutex_);
-                    ok = SSL_write_ex(ssl_, data + offset, length - offset, &written);
+                    ok = SslWriteCompat(ssl_, data + offset, length - offset, &written);
                     if (ok != 1) {
                         ssl_error = SSL_get_error(ssl_, ok);
                     }
@@ -1367,7 +1538,7 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
                 int ssl_error = 0;
                 {
                     std::lock_guard<std::mutex> lock(ssl_mutex_);
-                    ok = SSL_read_ex(ssl_, buffer.data(), buffer.size(), &read);
+                    ok = SslReadCompat(ssl_, buffer.data(), buffer.size(), &read);
                     if (ok != 1) {
                         ssl_error = SSL_get_error(ssl_, ok);
                     }
@@ -1502,7 +1673,7 @@ struct LoadServerConnectionState {
 class LoadServerController : public ITransportEventHandler {
   public:
     LoadServerController(const AppConfig& config, Stats& stats)
-        : config_(config), stats_(stats) {}
+        : config_(config), stats_(stats), trace_(config, "amf") {}
 
     void OnConnected(const std::shared_ptr<ITransportConnection>& connection) override {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1515,7 +1686,18 @@ class LoadServerController : public ITransportEventHandler {
         uint16_t stream_id,
         const uint8_t* data,
         size_t length) override {
+        struct QualcommAction {
+            std::vector<uint8_t> frame;
+            uint16_t stream_id{0};
+            uint64_t sequence{0};
+            uint8_t hop_in{0};
+            uint8_t hop_out{0};
+            uint64_t entry_realtime_ns{0};
+            uint64_t entry_mono_ns{0};
+            bool send{false};
+        };
         std::vector<std::vector<uint8_t>> sends;
+        std::vector<QualcommAction> qualcomm_actions;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto& state = connections_[connection->Id()];
@@ -1532,7 +1714,65 @@ class LoadServerController : public ITransportEventHandler {
                 receive_buffer.erase(
                     receive_buffer.begin(),
                     receive_buffer.begin() + static_cast<std::ptrdiff_t>(*frame_size));
+                if (config_.qualcomm_method) {
+                    const uint64_t entry_realtime_ns = RealtimeNs();
+                    const uint64_t entry_mono_ns = NowNs();
+                    MessageHeader header{};
+                    std::memcpy(&header, frame.data(), sizeof(header));
+                    const uint8_t hop_in = QualcommHop(frame);
+                    if (hop_in == kQualcommHopInitial) {
+                        SetQualcommHop(frame, kQualcommHopReflected);
+                        qualcomm_actions.push_back(QualcommAction{
+                            std::move(frame),
+                            stream_id,
+                            header.sequence,
+                            hop_in,
+                            kQualcommHopReflected,
+                            entry_realtime_ns,
+                            entry_mono_ns,
+                            true,
+                        });
+                    } else {
+                        ++qualcomm_final_receives_;
+                        qualcomm_actions.push_back(QualcommAction{
+                            std::move(frame),
+                            stream_id,
+                            header.sequence,
+                            hop_in,
+                            hop_in,
+                            entry_realtime_ns,
+                            entry_mono_ns,
+                            false,
+                        });
+                        done_cv_.notify_all();
+                    }
+                    continue;
+                }
                 sends.push_back(std::move(frame));
+            }
+        }
+
+        for (auto& action : qualcomm_actions) {
+            const uint64_t exit_mono_ns = NowNs();
+            const uint64_t exit_realtime_ns = RealtimeNs();
+            trace_.Log(
+                action.send ? "amf_turnaround" : "amf_final_receive",
+                action.sequence,
+                static_cast<uint32_t>(action.frame.size()),
+                action.hop_in,
+                action.hop_out,
+                action.entry_realtime_ns,
+                exit_realtime_ns,
+                action.entry_mono_ns,
+                exit_mono_ns);
+            stats_.AddReceived(action.frame.size());
+            if (action.send) {
+                MessageHeader header{};
+                std::memcpy(&header, action.frame.data(), sizeof(header));
+                header.send_timestamp_ns = exit_mono_ns;
+                std::memcpy(action.frame.data(), &header, sizeof(header));
+                connection->SendCopy(action.frame.data(), action.frame.size(), action.stream_id);
+                stats_.AddSent(action.frame.size());
             }
         }
 
@@ -1541,6 +1781,14 @@ class LoadServerController : public ITransportEventHandler {
             stats_.AddReceived(frame.size());
             stats_.AddSent(frame.size());
         }
+    }
+
+    bool QualcommDone() {
+        if (!config_.qualcomm_method) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        return qualcomm_final_receives_ >= config_.message_count;
     }
 
     void OnPeerClosed(const std::shared_ptr<ITransportConnection>& connection) override {
@@ -1564,8 +1812,11 @@ class LoadServerController : public ITransportEventHandler {
   private:
     const AppConfig& config_;
     Stats& stats_;
+    QualcommTraceWriter trace_;
     std::mutex mutex_;
+    std::condition_variable done_cv_;
     std::map<uint32_t, LoadServerConnectionState> connections_;
+    uint64_t qualcomm_final_receives_{0};
 };
 
 struct LoadClientStreamState {
@@ -1573,6 +1824,7 @@ struct LoadClientStreamState {
     std::vector<uint8_t> receive_buffer;
     uint64_t next_sequence{0};
     uint64_t echoed_messages{0};
+    uint64_t final_messages_sent{0};
     double next_send_time_ns{0.0};
 };
 
@@ -1590,9 +1842,11 @@ class LoadClientController : public ITransportEventHandler {
     LoadClientController(const AppConfig& config, Stats& stats)
         : config_(config),
           stats_(stats),
+          trace_(config, "ran"),
           stream_metrics_(config.stream_count),
           pacing_mode_(DeterminePacingMode(config)),
-          paced_(pacing_mode_ != PacingMode::Unlimited || HasStreamProfilePacing(config)),
+          paced_(pacing_mode_ != PacingMode::Unlimited || HasStreamProfilePacing(config) ||
+                 (config.qualcomm_method && config.qualcomm_gap_ms > 0)),
           active_send_connection_count_(ActiveSendConnectionCount(config)),
           pacing_interval_ns_(ComputePacingIntervalNs(config, pacing_mode_, active_send_connection_count_)) {}
 
@@ -1642,6 +1896,16 @@ class LoadClientController : public ITransportEventHandler {
         uint16_t stream_id,
         const uint8_t* data,
         size_t length) override {
+        struct FinalSend {
+            std::vector<uint8_t> frame;
+            uint16_t stream_id{0};
+            uint64_t sequence{0};
+            uint8_t hop_in{0};
+            uint8_t hop_out{0};
+            uint64_t entry_realtime_ns{0};
+            uint64_t entry_mono_ns{0};
+        };
+        std::vector<FinalSend> final_sends;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto& state = states_[connection->Id()];
@@ -1660,6 +1924,36 @@ class LoadClientController : public ITransportEventHandler {
                 MessageHeader header{};
                 std::memcpy(&header, stream_state.receive_buffer.data(), sizeof(header));
                 const uint32_t actual_frame_size = FrameSizeFromHeader(header, stream_state.profile.message_size);
+                if (config_.qualcomm_method) {
+                    const uint64_t entry_realtime_ns = RealtimeNs();
+                    const uint64_t entry_mono_ns = NowNs();
+                    std::vector<uint8_t> frame(actual_frame_size);
+                    std::memcpy(frame.data(), stream_state.receive_buffer.data(), actual_frame_size);
+                    const uint8_t hop_in = QualcommHop(frame);
+                    stream_state.receive_buffer.erase(
+                        stream_state.receive_buffer.begin(),
+                        stream_state.receive_buffer.begin() + static_cast<std::ptrdiff_t>(actual_frame_size));
+                    if (hop_in == kQualcommHopReflected) {
+                        SetQualcommHop(frame, kQualcommHopFinal);
+                        ++stream_state.echoed_messages;
+                        ++stream_state.final_messages_sent;
+                        stats_.AddReceived(actual_frame_size);
+                        stream_metrics_[stream_id - config_.sctp_stream_id].AddReceived(actual_frame_size, 0);
+                        final_sends.push_back(FinalSend{
+                            std::move(frame),
+                            stream_id,
+                            header.sequence,
+                            hop_in,
+                            kQualcommHopFinal,
+                            entry_realtime_ns,
+                            entry_mono_ns,
+                        });
+                    }
+                    if (stream_state.echoed_messages >= config_.message_count) {
+                        stop_sending_.store(true, std::memory_order_relaxed);
+                    }
+                    continue;
+                }
                 stream_state.receive_buffer.erase(
                     stream_state.receive_buffer.begin(),
                     stream_state.receive_buffer.begin() + static_cast<std::ptrdiff_t>(actual_frame_size));
@@ -1668,6 +1962,33 @@ class LoadClientController : public ITransportEventHandler {
                 stats_.AddReceived(actual_frame_size);
                 stats_.AddLatencyNs(latency_ns);
                 stream_metrics_[stream_id - config_.sctp_stream_id].AddReceived(actual_frame_size, latency_ns);
+            }
+        }
+        for (auto& final_send : final_sends) {
+            const uint64_t exit_mono_ns = NowNs();
+            const uint64_t exit_realtime_ns = RealtimeNs();
+            trace_.Log(
+                "ran_turnaround",
+                final_send.sequence,
+                static_cast<uint32_t>(final_send.frame.size()),
+                final_send.hop_in,
+                final_send.hop_out,
+                final_send.entry_realtime_ns,
+                exit_realtime_ns,
+                final_send.entry_mono_ns,
+                exit_mono_ns);
+            MessageHeader header{};
+            std::memcpy(&header, final_send.frame.data(), sizeof(header));
+            header.send_timestamp_ns = exit_mono_ns;
+            std::memcpy(final_send.frame.data(), &header, sizeof(header));
+            connection->SendCopy(final_send.frame.data(), final_send.frame.size(), final_send.stream_id);
+            stats_.AddSent(final_send.frame.size());
+            stream_metrics_[final_send.stream_id - config_.sctp_stream_id].AddSent(final_send.frame.size());
+            if (config_.qualcomm_method && config_.qualcomm_gap_ms > 0) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto& stream_state = states_[connection->Id()].streams[final_send.stream_id];
+                stream_state.next_send_time_ns =
+                    static_cast<double>(NowNs() + (config_.qualcomm_gap_ms * 1'000'000ULL));
             }
         }
         if (!paced_) {
@@ -1728,6 +2049,21 @@ class LoadClientController : public ITransportEventHandler {
         return done_cv_.wait_for(lock, timeout, [&]() {
             return closed_connections_.size() >= expected_connections;
         });
+    }
+
+    bool QualcommDone() {
+        if (!config_.qualcomm_method) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [_, state] : states_) {
+            for (const auto& [__, stream_state] : state.streams) {
+                if (stream_state.final_messages_sent >= config_.message_count) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     void PrintStreamSummaries(const char* prefix) const {
@@ -1957,6 +2293,13 @@ class LoadClientController : public ITransportEventHandler {
                     if ((stream_state.next_sequence - stream_state.echoed_messages) >= stream_state.profile.max_inflight) {
                         continue;
                     }
+                    if (config_.qualcomm_method && stream_state.next_sequence >= config_.message_count) {
+                        continue;
+                    }
+                    if (config_.qualcomm_method && config_.qualcomm_gap_ms > 0 &&
+                        stream_state.next_send_time_ns > static_cast<double>(NowNs())) {
+                        continue;
+                    }
                     if (stream_state.profile.send_pps > 0) {
                         const double now_ns = static_cast<double>(NowNs());
                         if (stream_state.next_send_time_ns == 0.0) {
@@ -1980,6 +2323,9 @@ class LoadClientController : public ITransportEventHandler {
                     std::memcpy(frame.data(), &header, sizeof(header));
                     for (uint32_t i = sizeof(header); i < frame.size(); ++i) {
                         frame[i] = static_cast<uint8_t>(header.sequence + i);
+                    }
+                    if (config_.qualcomm_method) {
+                        SetQualcommHop(frame, kQualcommHopInitial);
                     }
                     sends.push_back({stream_id, std::move(frame)});
                     state.next_send_stream_ordinal = (ordinal + 1) % config_.stream_count;
@@ -2028,6 +2374,7 @@ class LoadClientController : public ITransportEventHandler {
 
     const AppConfig& config_;
     Stats& stats_;
+    QualcommTraceWriter trace_;
     std::mutex mutex_;
     std::condition_variable done_cv_;
     std::map<uint32_t, LoadClientConnectionState> states_;
@@ -2095,6 +2442,8 @@ class SctpServerTransport : public ITransportRunner {
         if (stopped_.exchange(true, std::memory_order_relaxed)) {
             return;
         }
+
+        WakeAcceptLoops();
 
         for (int fd : listeners_) {
             ::shutdown(fd, SHUT_RDWR);
@@ -2190,6 +2539,10 @@ class SctpServerTransport : public ITransportRunner {
                 handler_.OnTransportError(std::numeric_limits<uint32_t>::max(), SocketErrorString("accept"));
                 return;
             }
+            if (stopped_.load(std::memory_order_relaxed)) {
+                ::close(accepted_fd);
+                return;
+            }
 
             try {
                 ConfigureSocket(accepted_fd);
@@ -2214,6 +2567,23 @@ class SctpServerTransport : public ITransportRunner {
                 ::close(accepted_fd);
                 handler_.OnTransportError(std::numeric_limits<uint32_t>::max(), ex.what());
             }
+        }
+    }
+
+    void WakeAcceptLoops() const {
+        for (uint32_t i = 0; i < config_.server_count; ++i) {
+            const int fd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP);
+            if (fd < 0) {
+                continue;
+            }
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_port = htons(static_cast<uint16_t>(config_.base_port + i));
+            const std::string host = config_.bind == "0.0.0.0" ? "127.0.0.1" : config_.bind;
+            if (::inet_pton(AF_INET, host.c_str(), &address.sin_addr) == 1) {
+                (void)::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+            }
+            ::close(fd);
         }
     }
 
@@ -2464,7 +2834,9 @@ class SctpServer {
 
     void Run() {
         transport_.Start();
-        stats_printer_.Start();
+        if (!config_.qualcomm_method) {
+            stats_printer_.Start();
+        }
 
         std::cout << "sctp server listening on " << config_.bind << " ports ";
         for (uint32_t i = 0; i < config_.server_count; ++i) {
@@ -2475,7 +2847,8 @@ class SctpServer {
         }
         std::cout << std::endl;
 
-        while (!g_stop_requested.load(std::memory_order_relaxed)) {
+        while (!g_stop_requested.load(std::memory_order_relaxed) &&
+               !(config_.qualcomm_method && controller_.QualcommDone())) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
 
@@ -2511,6 +2884,17 @@ class SctpClient {
 
     void Run() {
         transport_.Start();
+        if (config_.qualcomm_method) {
+            controller_.StartPacer();
+            while (!g_stop_requested.load(std::memory_order_relaxed) && !controller_.QualcommDone()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            controller_.StopPacer();
+            controller_.ForceShutdownAll();
+            transport_.Stop();
+            PrintSummary();
+            return;
+        }
         const auto deadline = Clock::now() + std::chrono::seconds(config_.duration_sec);
         const auto drain_deadline = deadline + std::chrono::milliseconds(config_.drain_timeout_ms);
 
@@ -2559,6 +2943,7 @@ class SctpClient {
     std::atomic<bool> stop_requested_{false};
 };
 
+#ifdef HAVE_MSQUIC
 class MsQuicApi {
   public:
     MsQuicApi() {
@@ -2700,11 +3085,14 @@ class Server {
           api_(),
           registration_(api_, "msquic-loadtest-server"),
           configuration_(api_, registration_.get(), config_, false),
+          trace_(config, "amf"),
           stats_printer_("server", stats_, config_.stats_interval_ms) {}
 
     void Run() {
         StartListeners();
-        stats_printer_.Start();
+        if (!config_.qualcomm_method) {
+            stats_printer_.Start();
+        }
 
         std::cout << "server listening on " << config_.bind << " ports ";
         for (uint32_t i = 0; i < config_.server_count; ++i) {
@@ -2715,7 +3103,9 @@ class Server {
         }
         std::cout << std::endl;
 
-        while (!g_stop_requested.load(std::memory_order_relaxed)) {
+        while (!g_stop_requested.load(std::memory_order_relaxed) &&
+               !(config_.qualcomm_method &&
+                 qualcomm_final_receives_.load(std::memory_order_relaxed) >= config_.message_count)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
 
@@ -2852,6 +3242,15 @@ class Server {
         switch (event->Type) {
         case QUIC_STREAM_EVENT_RECEIVE: {
             std::vector<std::unique_ptr<SendBuffer>> sends;
+            struct QualcommAction {
+                std::unique_ptr<SendBuffer> send;
+                uint64_t sequence{0};
+                uint8_t hop_in{0};
+                uint8_t hop_out{0};
+                uint64_t entry_realtime_ns{0};
+                uint64_t entry_mono_ns{0};
+            };
+            std::vector<QualcommAction> qualcomm_actions;
             {
                 std::lock_guard<std::mutex> lock(context->mutex);
                 for (uint32_t i = 0; i < event->RECEIVE.BufferCount; ++i) {
@@ -2872,6 +3271,35 @@ class Server {
                     context->receive_buffer.erase(
                         context->receive_buffer.begin(),
                         context->receive_buffer.begin() + static_cast<std::ptrdiff_t>(*frame_size));
+                    if (config_.qualcomm_method) {
+                        const uint64_t entry_realtime_ns = RealtimeNs();
+                        const uint64_t entry_mono_ns = NowNs();
+                        MessageHeader header{};
+                        std::memcpy(&header, send->storage.data(), sizeof(header));
+                        const uint8_t hop_in = QualcommHop(send->storage);
+                        if (hop_in == kQualcommHopInitial) {
+                            SetQualcommHop(send->storage, kQualcommHopReflected);
+                            ++context->pending_sends;
+                            qualcomm_actions.push_back(QualcommAction{
+                                std::move(send),
+                                header.sequence,
+                                hop_in,
+                                kQualcommHopReflected,
+                                entry_realtime_ns,
+                                entry_mono_ns,
+                            });
+                        } else {
+                            qualcomm_actions.push_back(QualcommAction{
+                                std::move(send),
+                                header.sequence,
+                                hop_in,
+                                hop_in,
+                                entry_realtime_ns,
+                                entry_mono_ns,
+                            });
+                        }
+                        continue;
+                    }
                     ++context->pending_sends;
                     sends.push_back(std::move(send));
                 }
@@ -2879,6 +3307,45 @@ class Server {
                 if ((event->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0) {
                     context->peer_finished = true;
                 }
+            }
+
+            for (auto& action : qualcomm_actions) {
+                const uint64_t exit_mono_ns = NowNs();
+                const uint64_t exit_realtime_ns = RealtimeNs();
+                trace_.Log(
+                    action.hop_out == kQualcommHopReflected ? "amf_turnaround" : "amf_final_receive",
+                    action.sequence,
+                    action.send == nullptr ? 0 : action.send->quic_buffer.Length,
+                    action.hop_in,
+                    action.hop_out,
+                    action.entry_realtime_ns,
+                    exit_realtime_ns,
+                    action.entry_mono_ns,
+                    exit_mono_ns);
+                if (action.send == nullptr) {
+                    continue;
+                }
+                stats_.AddReceived(action.send->quic_buffer.Length);
+                if (action.hop_out != kQualcommHopReflected) {
+                    qualcomm_final_receives_.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                MessageHeader header{};
+                std::memcpy(&header, action.send->storage.data(), sizeof(header));
+                header.send_timestamp_ns = exit_mono_ns;
+                std::memcpy(action.send->storage.data(), &header, sizeof(header));
+                auto* raw_send = action.send.release();
+                const auto status = api_->StreamSend(
+                    stream,
+                    &raw_send->quic_buffer,
+                    1,
+                    QUIC_SEND_FLAG_NONE,
+                    raw_send);
+                if (QUIC_FAILED(status)) {
+                    delete raw_send;
+                    return status;
+                }
+                stats_.AddSent(raw_send->quic_buffer.Length);
             }
 
             for (auto& send : sends) {
@@ -2943,8 +3410,10 @@ class Server {
     Registration registration_;
     Configuration configuration_;
     Stats stats_;
+    QualcommTraceWriter trace_;
     StatsPrinter stats_printer_;
     std::vector<std::unique_ptr<ListenerHandle>> listeners_;
+    std::atomic<uint64_t> qualcomm_final_receives_{0};
 };
 
 class Client {
@@ -2954,6 +3423,7 @@ class Client {
           api_(),
           registration_(api_, "msquic-loadtest-client"),
           configuration_(api_, registration_.get(), config_, true),
+          trace_(config, "ran"),
           stream_metrics_(config.stream_count),
           stats_printer_("client", stats_, config_.stats_interval_ms),
           pacing_mode_(DeterminePacingMode(config)),
@@ -2967,6 +3437,17 @@ class Client {
 
     void Run() {
         StartConnections();
+        if (config_.qualcomm_method) {
+            while (!g_stop_requested.load(std::memory_order_relaxed) && !QualcommDone()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            for (auto& connection : connections_) {
+                ForceShutdown(*connection);
+            }
+            WaitForConnectionsToClose();
+            PrintSummary();
+            return;
+        }
         deadline_ = Clock::now() + std::chrono::seconds(config_.duration_sec);
         drain_deadline_ = deadline_ + std::chrono::milliseconds(config_.drain_timeout_ms);
 
@@ -3051,6 +3532,7 @@ class Client {
         std::vector<uint8_t> receive_buffer;
         uint64_t next_sequence{0};
         uint64_t echoed_messages{0};
+        uint64_t final_messages_sent{0};
         double next_send_time_ns{0.0};
         bool stream_started{false};
         bool shutdown_started{false};
@@ -3152,6 +3634,21 @@ class Client {
             }
         }
         return true;
+    }
+
+    bool QualcommDone() {
+        if (!config_.qualcomm_method) {
+            return false;
+        }
+        for (const auto& connection : connections_) {
+            for (const auto& stream_ctx : connection->stream_contexts) {
+                std::lock_guard<std::mutex> stream_lock(stream_ctx->mutex);
+                if (stream_ctx->final_messages_sent >= config_.message_count) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     void StartPacer() {
@@ -3259,6 +3756,9 @@ class Client {
                 if ((candidate->next_sequence - candidate->echoed_messages) >= candidate->profile.max_inflight) {
                     continue;
                 }
+                if (config_.qualcomm_method && candidate->next_sequence >= config_.message_count) {
+                    continue;
+                }
                 if (candidate->profile.send_pps > 0) {
                     const double now_ns = static_cast<double>(NowNs());
                     if (candidate->next_send_time_ns == 0.0) {
@@ -3298,6 +3798,9 @@ class Client {
 
             for (uint32_t i = sizeof(header); i < send->storage.size(); ++i) {
                 send->storage[i] = static_cast<uint8_t>(header.sequence + i);
+            }
+            if (config_.qualcomm_method) {
+                SetQualcommHop(send->storage, kQualcommHopInitial);
             }
 
             auto* raw_send = send.release();
@@ -3398,6 +3901,15 @@ class Client {
             break;
         }
         case QUIC_STREAM_EVENT_RECEIVE: {
+            struct FinalSend {
+                std::unique_ptr<SendBuffer> send;
+                uint64_t sequence{0};
+                uint8_t hop_in{0};
+                uint8_t hop_out{0};
+                uint64_t entry_realtime_ns{0};
+                uint64_t entry_mono_ns{0};
+            };
+            std::vector<FinalSend> final_sends;
             {
                 std::lock_guard<std::mutex> lock(stream_ctx->mutex);
                 for (uint32_t i = 0; i < event->RECEIVE.BufferCount; ++i) {
@@ -3416,6 +3928,35 @@ class Client {
                     MessageHeader header{};
                     std::memcpy(&header, stream_ctx->receive_buffer.data(), sizeof(header));
                     const uint32_t actual_frame_size = FrameSizeFromHeader(header, stream_ctx->profile.message_size);
+                    if (config_.qualcomm_method) {
+                        const uint64_t entry_realtime_ns = RealtimeNs();
+                        const uint64_t entry_mono_ns = NowNs();
+                        auto send = std::make_unique<SendBuffer>(actual_frame_size);
+                        std::memcpy(send->storage.data(), stream_ctx->receive_buffer.data(), actual_frame_size);
+                        const uint8_t hop_in = QualcommHop(send->storage);
+                        stream_ctx->receive_buffer.erase(
+                            stream_ctx->receive_buffer.begin(),
+                            stream_ctx->receive_buffer.begin() + static_cast<std::ptrdiff_t>(actual_frame_size));
+                        if (hop_in == kQualcommHopReflected) {
+                            SetQualcommHop(send->storage, kQualcommHopFinal);
+                            ++stream_ctx->echoed_messages;
+                            ++stream_ctx->final_messages_sent;
+                            stats_.AddReceived(actual_frame_size);
+                            stream_metrics_[stream_ctx->ordinal].AddReceived(actual_frame_size, 0);
+                            final_sends.push_back(FinalSend{
+                                std::move(send),
+                                header.sequence,
+                                hop_in,
+                                kQualcommHopFinal,
+                                entry_realtime_ns,
+                                entry_mono_ns,
+                            });
+                        }
+                        if (stream_ctx->echoed_messages >= config_.message_count) {
+                            stop_sending_.store(true, std::memory_order_relaxed);
+                        }
+                        continue;
+                    }
                     const auto latency_ns = NowNs() - header.send_timestamp_ns;
                     stats_.AddReceived(actual_frame_size);
                     stats_.AddLatencyNs(latency_ns);
@@ -3426,6 +3967,38 @@ class Client {
                         stream_ctx->receive_buffer.begin(),
                         stream_ctx->receive_buffer.begin() + static_cast<std::ptrdiff_t>(actual_frame_size));
                 }
+            }
+
+            for (auto& final_send : final_sends) {
+                const uint64_t exit_mono_ns = NowNs();
+                const uint64_t exit_realtime_ns = RealtimeNs();
+                trace_.Log(
+                    "ran_turnaround",
+                    final_send.sequence,
+                    final_send.send == nullptr ? 0 : final_send.send->quic_buffer.Length,
+                    final_send.hop_in,
+                    final_send.hop_out,
+                    final_send.entry_realtime_ns,
+                    exit_realtime_ns,
+                    final_send.entry_mono_ns,
+                    exit_mono_ns);
+                if (final_send.send == nullptr) {
+                    continue;
+                }
+                MessageHeader header{};
+                std::memcpy(&header, final_send.send->storage.data(), sizeof(header));
+                header.send_timestamp_ns = exit_mono_ns;
+                std::memcpy(final_send.send->storage.data(), &header, sizeof(header));
+                auto* raw_send = final_send.send.release();
+                const auto status = api_->StreamSend(stream, &raw_send->quic_buffer, 1, QUIC_SEND_FLAG_NONE, raw_send);
+                if (QUIC_FAILED(status)) {
+                    delete raw_send;
+                    std::cerr << "StreamSend(final) failed: " << StatusToHex(status) << std::endl;
+                    api_->ConnectionShutdown(connection.connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 1);
+                    break;
+                }
+                stats_.AddSent(raw_send->quic_buffer.Length);
+                stream_metrics_[stream_ctx->ordinal].AddSent(raw_send->quic_buffer.Length);
             }
 
             if (!paced_) {
@@ -3491,6 +4064,7 @@ class Client {
     Registration registration_;
     Configuration configuration_;
     Stats stats_;
+    QualcommTraceWriter trace_;
     std::vector<StreamMetrics> stream_metrics_;
     StatsPrinter stats_printer_;
     std::vector<std::unique_ptr<ConnectionContext>> connections_;
@@ -3507,6 +4081,603 @@ class Client {
     Clock::time_point deadline_{};
     Clock::time_point drain_deadline_{};
 };
+#endif
+
+#ifdef HAVE_LSQUIC
+class LsQuicEndpoint {
+  public:
+    explicit LsQuicEndpoint(const AppConfig& config, bool server)
+        : config_(config),
+          is_server_(server),
+          trace_(config, server ? "amf" : "ran"),
+          stats_printer_(server ? "server" : "client", stats_, config.stats_interval_ms) {
+        if (!config_.qualcomm_method) {
+            throw std::runtime_error("--protocol=lsquic is implemented only for --qualcomm-method=1");
+        }
+        if (config_.sctp_tls) {
+            throw std::runtime_error("--protocol=lsquic does not use SCTP TLS options");
+        }
+        InitSsl();
+        InitSocket();
+        InitEngine();
+    }
+
+    ~LsQuicEndpoint() {
+        if (engine_ != nullptr) {
+            lsquic_engine_destroy(engine_);
+        }
+        if (ssl_ctx_ != nullptr) {
+            SSL_CTX_free(ssl_ctx_);
+        }
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+        lsquic_global_cleanup();
+    }
+
+    void Run() {
+        if (is_server_) {
+            std::cout << "lsquic server listening on " << config_.bind << " port " << config_.base_port << std::endl;
+        } else {
+            StartClientConnection();
+        }
+
+        while (!g_stop_requested.load(std::memory_order_relaxed) && !Done()) {
+            MaybeQueueDelayedInitial();
+            PumpEngine();
+            pollfd pfd{};
+            pfd.fd = fd_;
+            pfd.events = POLLIN;
+            const int timeout_ms = PollTimeoutMs();
+            const int rc = ::poll(&pfd, 1, timeout_ms);
+            if (rc > 0 && (pfd.revents & POLLIN) != 0) {
+                ReadPackets();
+            } else if (rc < 0 && errno != EINTR) {
+                throw std::runtime_error(SocketErrorString("poll(lsquic)"));
+            }
+            MaybeQueueDelayedInitial();
+            PumpEngine();
+        }
+
+        if (conn_ != nullptr) {
+            lsquic_conn_close(conn_);
+            PumpEngine();
+        }
+        PrintSummary();
+    }
+
+  private:
+    struct ConnCtx {
+        LsQuicEndpoint* endpoint{nullptr};
+        lsquic_conn_t* conn{nullptr};
+    };
+
+    struct PendingFrame {
+        std::vector<uint8_t> frame;
+        const char* event{nullptr};
+        uint64_t sequence{0};
+        uint8_t hop_in{0};
+        uint8_t hop_out{0};
+        uint64_t entry_realtime_ns{0};
+        uint64_t entry_mono_ns{0};
+        bool logged{false};
+    };
+
+    struct StreamCtx {
+        LsQuicEndpoint* endpoint{nullptr};
+        lsquic_stream_t* stream{nullptr};
+        std::vector<uint8_t> receive_buffer;
+        std::deque<PendingFrame> pending;
+        uint64_t next_sequence{0};
+        uint64_t echoed_messages{0};
+        uint64_t final_messages_sent{0};
+        uint64_t next_initial_ready_ns{0};
+    };
+
+    static lsquic_conn_ctx_t* OnNewConn(void* stream_if_ctx, lsquic_conn_t* conn) {
+        auto* endpoint = static_cast<LsQuicEndpoint*>(stream_if_ctx);
+        auto* ctx = new ConnCtx{endpoint, conn};
+        endpoint->conn_ = conn;
+        if (!endpoint->is_server_) {
+            lsquic_conn_make_stream(conn);
+        }
+        return reinterpret_cast<lsquic_conn_ctx_t*>(ctx);
+    }
+
+    static void OnConnClosed(lsquic_conn_t* conn) {
+        auto* ctx = reinterpret_cast<ConnCtx*>(lsquic_conn_get_ctx(conn));
+        if (ctx != nullptr) {
+            ctx->endpoint->conn_ = nullptr;
+            lsquic_conn_set_ctx(conn, nullptr);
+            delete ctx;
+        }
+    }
+
+    static lsquic_stream_ctx_t* OnNewStream(void* stream_if_ctx, lsquic_stream_t* stream) {
+        auto* endpoint = static_cast<LsQuicEndpoint*>(stream_if_ctx);
+        auto* ctx = new StreamCtx{endpoint, stream};
+        endpoint->stream_ = stream;
+        endpoint->stream_ctx_ = ctx;
+        if (endpoint->is_server_) {
+            lsquic_stream_wantread(stream, 1);
+        } else {
+            endpoint->QueueInitial(*ctx);
+            lsquic_stream_wantwrite(stream, 1);
+        }
+        return reinterpret_cast<lsquic_stream_ctx_t*>(ctx);
+    }
+
+    static void OnRead(lsquic_stream_t* stream, lsquic_stream_ctx_t* raw_ctx) {
+        auto* ctx = reinterpret_cast<StreamCtx*>(raw_ctx);
+        ctx->endpoint->HandleRead(stream, *ctx);
+    }
+
+    static void OnWrite(lsquic_stream_t* stream, lsquic_stream_ctx_t* raw_ctx) {
+        auto* ctx = reinterpret_cast<StreamCtx*>(raw_ctx);
+        ctx->endpoint->HandleWrite(stream, *ctx);
+    }
+
+    static void OnClose(lsquic_stream_t*, lsquic_stream_ctx_t* raw_ctx) {
+        auto* ctx = reinterpret_cast<StreamCtx*>(raw_ctx);
+        if (ctx != nullptr) {
+            ctx->endpoint->stream_ = nullptr;
+            ctx->endpoint->stream_ctx_ = nullptr;
+            delete ctx;
+        }
+    }
+
+    static int PacketsOut(void* packets_out_ctx, const lsquic_out_spec* out_spec, unsigned n_packets_out) {
+        auto* endpoint = static_cast<LsQuicEndpoint*>(packets_out_ctx);
+        unsigned sent = 0;
+        for (; sent < n_packets_out; ++sent) {
+            msghdr msg{};
+            msg.msg_name = const_cast<sockaddr*>(out_spec[sent].dest_sa);
+            msg.msg_namelen = SockaddrLen(*out_spec[sent].dest_sa);
+            msg.msg_iov = out_spec[sent].iov;
+            msg.msg_iovlen = out_spec[sent].iovlen;
+            const ssize_t rc = ::sendmsg(endpoint->fd_, &msg, 0);
+            if (rc < 0) {
+                return sent == 0 ? -1 : static_cast<int>(sent);
+            }
+        }
+        return static_cast<int>(sent);
+    }
+
+    static SSL_CTX* LookupCert(void* ctx, const sockaddr*, const char*) {
+        return static_cast<LsQuicEndpoint*>(ctx)->ssl_ctx_;
+    }
+
+    static SSL_CTX* GetSslCtx(void* ctx, const sockaddr*) {
+        return static_cast<LsQuicEndpoint*>(ctx)->ssl_ctx_;
+    }
+
+    static int SelectAlpn(SSL*, const unsigned char** out, unsigned char* outlen,
+                          const unsigned char* in, unsigned int inlen, void* arg) {
+        const auto* endpoint = static_cast<LsQuicEndpoint*>(arg);
+        const std::string& alpn = endpoint->config_.alpn;
+        const unsigned char* p = in;
+        const unsigned char* end = in + inlen;
+        while (p < end) {
+            const unsigned int len = *p++;
+            if (p + len <= end && len == alpn.size() && std::memcmp(p, alpn.data(), len) == 0) {
+                *out = p;
+                *outlen = static_cast<unsigned char>(len);
+                return SSL_TLSEXT_ERR_OK;
+            }
+            p += len;
+        }
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+
+    static socklen_t SockaddrLen(const sockaddr& address) {
+        return address.sa_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in);
+    }
+
+    void InitSsl() {
+        ssl_ctx_ = SSL_CTX_new(TLS_method());
+        if (ssl_ctx_ == nullptr) {
+            throw std::runtime_error(OpenSslErrorString("SSL_CTX_new"));
+        }
+        SSL_CTX_set_min_proto_version(ssl_ctx_, TLS1_3_VERSION);
+        SSL_CTX_set_max_proto_version(ssl_ctx_, TLS1_3_VERSION);
+        SSL_CTX_set_default_verify_paths(ssl_ctx_);
+        if (is_server_) {
+            if (SSL_CTX_use_certificate_chain_file(ssl_ctx_, config_.cert_file.c_str()) != 1) {
+                throw std::runtime_error(OpenSslErrorString("SSL_CTX_use_certificate_chain_file"));
+            }
+            if (SSL_CTX_use_PrivateKey_file(ssl_ctx_, config_.key_file.c_str(), SSL_FILETYPE_PEM) != 1) {
+                throw std::runtime_error(OpenSslErrorString("SSL_CTX_use_PrivateKey_file"));
+            }
+            SSL_CTX_set_alpn_select_cb(ssl_ctx_, SelectAlpn, this);
+        } else if (!config_.verify_peer) {
+            SSL_CTX_set_verify(ssl_ctx_, SSL_VERIFY_NONE, nullptr);
+        }
+    }
+
+    void InitSocket() {
+        fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd_ < 0) {
+            throw std::runtime_error(SocketErrorString("socket(AF_INET, SOCK_DGRAM)"));
+        }
+        int reuse = 1;
+        (void)::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        int flags = ::fcntl(fd_, F_GETFL, 0);
+        if (flags >= 0) {
+            (void)::fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
+        }
+
+        sockaddr_in bind_address{};
+        bind_address.sin_family = AF_INET;
+        bind_address.sin_port = htons(is_server_ ? config_.base_port : 0);
+        const std::string bind_host = is_server_ ? config_.bind : "0.0.0.0";
+        if (::inet_pton(AF_INET, bind_host.c_str(), &bind_address.sin_addr) != 1) {
+            throw std::runtime_error("LSQUIC currently supports IPv4 addresses only");
+        }
+        if (::bind(fd_, reinterpret_cast<sockaddr*>(&bind_address), sizeof(bind_address)) != 0) {
+            throw std::runtime_error(SocketErrorString("bind(lsquic)"));
+        }
+
+        local_len_ = sizeof(local_addr_);
+        if (::getsockname(fd_, reinterpret_cast<sockaddr*>(&local_addr_), &local_len_) != 0) {
+            throw std::runtime_error(SocketErrorString("getsockname(lsquic)"));
+        }
+
+        if (!is_server_) {
+            const sockaddr_in peer = ResolveIpv4Address(config_.target, config_.base_port, "LSQUIC client");
+            std::memcpy(&peer_addr_, &peer, sizeof(peer));
+            peer_len_ = sizeof(peer);
+        }
+    }
+
+    void InitEngine() {
+        const int global_flags = is_server_ ? LSQUIC_GLOBAL_SERVER : LSQUIC_GLOBAL_CLIENT;
+        if (lsquic_global_init(global_flags) != 0) {
+            throw std::runtime_error("lsquic_global_init failed");
+        }
+        const unsigned engine_flags = is_server_ ? LSENG_SERVER : 0;
+        lsquic_engine_init_settings(&settings_, engine_flags);
+        settings_.es_pace_packets = 0;
+        settings_.es_max_streams_in = 1;
+        settings_.es_init_max_streams_bidi = 1;
+        settings_.es_idle_conn_to = config_.idle_timeout_ms * 1000;
+        settings_.es_scid_len = 8;
+
+        api_.ea_settings = &settings_;
+        api_.ea_stream_if = &stream_if_;
+        api_.ea_stream_if_ctx = this;
+        api_.ea_packets_out = PacketsOut;
+        api_.ea_packets_out_ctx = this;
+        api_.ea_alpn = config_.alpn.c_str();
+        api_.ea_get_ssl_ctx = GetSslCtx;
+        if (is_server_) {
+            api_.ea_lookup_cert = LookupCert;
+            api_.ea_cert_lu_ctx = this;
+        }
+
+        engine_ = lsquic_engine_new(engine_flags, &api_);
+        if (engine_ == nullptr) {
+            throw std::runtime_error("lsquic_engine_new failed");
+        }
+    }
+
+    void StartClientConnection() {
+        conn_ = lsquic_engine_connect(
+            engine_,
+            N_LSQVER,
+            reinterpret_cast<sockaddr*>(&local_addr_),
+            reinterpret_cast<sockaddr*>(&peer_addr_),
+            this,
+            nullptr,
+            config_.target.c_str(),
+            0,
+            nullptr,
+            0,
+            nullptr,
+            0);
+        if (conn_ == nullptr) {
+            throw std::runtime_error("lsquic_engine_connect failed");
+        }
+        std::cout << "lsquic client connecting to " << config_.target << ":" << config_.base_port << std::endl;
+    }
+
+    void PumpEngine() {
+        lsquic_engine_process_conns(engine_);
+        while (lsquic_engine_has_unsent_packets(engine_)) {
+            lsquic_engine_send_unsent_packets(engine_);
+        }
+    }
+
+    int PollTimeoutMs() {
+        int diff_us = 0;
+        if (lsquic_engine_earliest_adv_tick(engine_, &diff_us)) {
+            if (diff_us <= 0) {
+                return 0;
+            }
+            return std::max(1, std::min(20, diff_us / 1000));
+        }
+        return 20;
+    }
+
+    void ReadPackets() {
+        while (true) {
+            std::array<uint8_t, 4096> buffer{};
+            sockaddr_storage peer{};
+            socklen_t peer_len = sizeof(peer);
+            const ssize_t bytes = ::recvfrom(
+                fd_,
+                buffer.data(),
+                buffer.size(),
+                0,
+                reinterpret_cast<sockaddr*>(&peer),
+                &peer_len);
+            if (bytes < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                    return;
+                }
+                throw std::runtime_error(SocketErrorString("recvfrom(lsquic)"));
+            }
+            if (is_server_ && peer_len_ == 0) {
+                std::memcpy(&peer_addr_, &peer, peer_len);
+                peer_len_ = peer_len;
+            }
+            if (lsquic_engine_packet_in(
+                    engine_,
+                    buffer.data(),
+                    static_cast<size_t>(bytes),
+                    reinterpret_cast<sockaddr*>(&local_addr_),
+                    reinterpret_cast<sockaddr*>(&peer),
+                    this,
+                    0) < 0) {
+                throw std::runtime_error("lsquic_engine_packet_in failed");
+            }
+        }
+    }
+
+    void HandleRead(lsquic_stream_t* stream, StreamCtx& ctx) {
+        std::array<uint8_t, 4096> buffer{};
+        while (true) {
+            const ssize_t bytes = lsquic_stream_read(stream, buffer.data(), buffer.size());
+            if (bytes > 0) {
+                ctx.receive_buffer.insert(ctx.receive_buffer.end(), buffer.begin(), buffer.begin() + bytes);
+                ProcessFrames(stream, ctx);
+                continue;
+            }
+            if (bytes == 0) {
+                return;
+            }
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                break;
+            }
+            if ((is_server_ && server_final_receives_ >= config_.message_count) ||
+                (!is_server_ && client_final_sent_all_) ||
+                errno == 0) {
+                return;
+            }
+            throw std::runtime_error("lsquic_stream_read failed");
+        }
+        lsquic_stream_wantread(stream, 1);
+    }
+
+    void ProcessFrames(lsquic_stream_t* stream, StreamCtx& ctx) {
+        while (true) {
+            const auto frame_size = TryPeekFrameSize(ctx.receive_buffer, config_.message_size);
+            if (!frame_size.has_value()) {
+                return;
+            }
+            std::vector<uint8_t> frame(*frame_size);
+            std::memcpy(frame.data(), ctx.receive_buffer.data(), *frame_size);
+            ctx.receive_buffer.erase(
+                ctx.receive_buffer.begin(),
+                ctx.receive_buffer.begin() + static_cast<std::ptrdiff_t>(*frame_size));
+
+            MessageHeader header{};
+            std::memcpy(&header, frame.data(), sizeof(header));
+            const uint64_t entry_realtime_ns = RealtimeNs();
+            const uint64_t entry_mono_ns = NowNs();
+            const uint8_t hop_in = QualcommHop(frame);
+
+            if (is_server_) {
+                stats_.AddReceived(frame.size());
+                if (hop_in == kQualcommHopInitial) {
+                    SetQualcommHop(frame, kQualcommHopReflected);
+                    ctx.pending.push_back(PendingFrame{
+                        std::move(frame),
+                        "amf_turnaround",
+                        header.sequence,
+                        hop_in,
+                        kQualcommHopReflected,
+                        entry_realtime_ns,
+                        entry_mono_ns,
+                        false,
+                    });
+                    lsquic_stream_wantwrite(stream, 1);
+                } else if (hop_in == kQualcommHopFinal) {
+                    trace_.Log(
+                        "amf_final_receive",
+                        header.sequence,
+                        static_cast<uint32_t>(frame.size()),
+                        hop_in,
+                        hop_in,
+                        entry_realtime_ns,
+                        RealtimeNs(),
+                        entry_mono_ns,
+                        NowNs());
+                    ++server_final_receives_;
+                    if (server_final_receives_ >= config_.message_count && conn_ != nullptr) {
+                        lsquic_conn_close(conn_);
+                    }
+                }
+            } else if (hop_in == kQualcommHopReflected) {
+                SetQualcommHop(frame, kQualcommHopFinal);
+                ++ctx.echoed_messages;
+                ++ctx.final_messages_sent;
+                stats_.AddReceived(frame.size());
+                ctx.pending.push_back(PendingFrame{
+                    std::move(frame),
+                    "ran_turnaround",
+                    header.sequence,
+                    hop_in,
+                    kQualcommHopFinal,
+                    entry_realtime_ns,
+                    entry_mono_ns,
+                    false,
+                });
+                lsquic_stream_wantwrite(stream, 1);
+            }
+        }
+    }
+
+    void HandleWrite(lsquic_stream_t* stream, StreamCtx& ctx) {
+        while (!ctx.pending.empty()) {
+            auto& pending = ctx.pending.front();
+            if (!pending.logged && pending.event != nullptr) {
+                const uint64_t exit_mono_ns = NowNs();
+                const uint64_t exit_realtime_ns = RealtimeNs();
+                trace_.Log(
+                    pending.event,
+                    pending.sequence,
+                    static_cast<uint32_t>(pending.frame.size()),
+                    pending.hop_in,
+                    pending.hop_out,
+                    pending.entry_realtime_ns,
+                    exit_realtime_ns,
+                    pending.entry_mono_ns,
+                    exit_mono_ns);
+                MessageHeader header{};
+                std::memcpy(&header, pending.frame.data(), sizeof(header));
+                header.send_timestamp_ns = exit_mono_ns;
+                std::memcpy(pending.frame.data(), &header, sizeof(header));
+                pending.logged = true;
+            }
+            const ssize_t written = lsquic_stream_write(stream, pending.frame.data(), pending.frame.size());
+            if (written < 0) {
+                if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                    break;
+                }
+                throw std::runtime_error("lsquic_stream_write failed");
+            }
+            if (static_cast<size_t>(written) != pending.frame.size()) {
+                throw std::runtime_error("partial LSQUIC stream write in fast-test mode");
+            }
+            stats_.AddSent(pending.frame.size());
+            const bool sent_final = !is_server_ && pending.hop_out == kQualcommHopFinal;
+            ctx.pending.pop_front();
+            if (sent_final) {
+                if (ctx.final_messages_sent >= config_.message_count) {
+                    client_final_sent_all_ = true;
+                    client_final_sent_time_ = Clock::now();
+                } else if (config_.qualcomm_gap_ms > 0) {
+                    ctx.next_initial_ready_ns = NowNs() + (config_.qualcomm_gap_ms * 1'000'000ULL);
+                } else {
+                    QueueInitial(ctx);
+                }
+            }
+        }
+        lsquic_stream_flush(stream);
+        lsquic_stream_wantwrite(stream, ctx.pending.empty() ? 0 : 1);
+        lsquic_stream_wantread(stream, 1);
+    }
+
+    void MaybeQueueDelayedInitial() {
+        if (is_server_ || stream_ == nullptr || stream_ctx_ == nullptr ||
+            config_.qualcomm_gap_ms == 0 || stream_ctx_->next_initial_ready_ns == 0) {
+            return;
+        }
+        if (NowNs() < stream_ctx_->next_initial_ready_ns) {
+            return;
+        }
+        stream_ctx_->next_initial_ready_ns = 0;
+        QueueInitial(*stream_ctx_);
+        lsquic_stream_wantwrite(stream_, 1);
+    }
+
+    void QueueInitial(StreamCtx& ctx) {
+        if (ctx.next_sequence >= config_.message_count) {
+            return;
+        }
+        std::vector<uint8_t> frame(config_.message_size);
+        MessageHeader header{};
+        header.magic = kMessageMagic;
+        header.reserved = static_cast<uint32_t>(frame.size());
+        header.sequence = ctx.next_sequence++;
+        header.send_timestamp_ns = NowNs();
+        std::memcpy(frame.data(), &header, sizeof(header));
+        for (uint32_t i = sizeof(header); i < frame.size(); ++i) {
+            frame[i] = static_cast<uint8_t>(header.sequence + i);
+        }
+        SetQualcommHop(frame, kQualcommHopInitial);
+        ctx.pending.push_back(PendingFrame{
+            std::move(frame),
+            nullptr,
+            header.sequence,
+            kQualcommHopInitial,
+            kQualcommHopInitial,
+            0,
+            0,
+            true,
+        });
+    }
+
+    bool Done() const {
+        if (is_server_) {
+            return server_final_receives_ >= config_.message_count;
+        }
+        return client_final_sent_all_ &&
+               Clock::now() - client_final_sent_time_ >= std::chrono::milliseconds(200);
+    }
+
+    void PrintSummary() {
+        const auto snapshot = stats_.SnapshotNow();
+        if (is_server_) {
+            std::cout << "server summary: "
+                      << "tx_messages=" << snapshot.sent_messages
+                      << " rx_messages=" << snapshot.recv_messages
+                      << " latency_ms(p50/p75/p99)=n/a/n/a/n/a"
+                      << std::endl;
+        } else {
+            std::cout << "client summary: "
+                      << "sent_messages=" << snapshot.sent_messages
+                      << " echoed_messages=" << snapshot.recv_messages
+                      << " sent_bytes=" << snapshot.sent_bytes
+                      << " echoed_bytes=" << snapshot.recv_bytes
+                      << " latency_ms(p50/p75/p99)=n/a/n/a/n/a"
+                      << std::endl;
+        }
+    }
+
+    const AppConfig& config_;
+    bool is_server_{false};
+    QualcommTraceWriter trace_;
+    Stats stats_;
+    StatsPrinter stats_printer_;
+    int fd_{-1};
+    sockaddr_storage local_addr_{};
+    socklen_t local_len_{0};
+    sockaddr_storage peer_addr_{};
+    socklen_t peer_len_{0};
+    SSL_CTX* ssl_ctx_{nullptr};
+    lsquic_engine_settings settings_{};
+    lsquic_engine_api api_{};
+    lsquic_engine_t* engine_{nullptr};
+    lsquic_conn_t* conn_{nullptr};
+    lsquic_stream_t* stream_{nullptr};
+    StreamCtx* stream_ctx_{nullptr};
+    uint64_t server_final_receives_{0};
+    bool client_final_sent_all_{false};
+    Clock::time_point client_final_sent_time_{};
+    static const lsquic_stream_if stream_if_;
+};
+
+const lsquic_stream_if LsQuicEndpoint::stream_if_ = {
+    .on_new_conn = LsQuicEndpoint::OnNewConn,
+    .on_goaway_received = nullptr,
+    .on_conn_closed = LsQuicEndpoint::OnConnClosed,
+    .on_new_stream = LsQuicEndpoint::OnNewStream,
+    .on_read = LsQuicEndpoint::OnRead,
+    .on_write = LsQuicEndpoint::OnWrite,
+    .on_close = LsQuicEndpoint::OnClose,
+};
+#endif
 
 } // namespace
 
@@ -3530,7 +4701,15 @@ int main(int argc, char** argv) {
                 SctpClient client(config);
                 client.Run();
             }
+        } else if (config.protocol == Protocol::LsQuic) {
+#ifdef HAVE_LSQUIC
+            LsQuicEndpoint endpoint(config, config.mode == "server");
+            endpoint.Run();
+#else
+            throw std::runtime_error("LSQUIC backend is not built; set -DLSQUIC_ROOT and -DBORINGSSL_ROOT or use --protocol=sctp");
+#endif
         } else {
+#ifdef HAVE_MSQUIC
             if (config.mode == "server") {
                 Server server(config);
                 server.Run();
@@ -3538,6 +4717,9 @@ int main(int argc, char** argv) {
                 Client client(config);
                 client.Run();
             }
+#else
+            throw std::runtime_error("MSQuic backend is not built; install MSQuic or use --protocol=sctp");
+#endif
         }
         return 0;
     } catch (const std::exception& ex) {
