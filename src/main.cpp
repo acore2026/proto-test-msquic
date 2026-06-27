@@ -614,6 +614,18 @@ void SetQualcommHop(std::vector<uint8_t>& frame, uint8_t hop) {
 
 class QualcommTraceWriter {
   public:
+    struct Record {
+        const char* event;
+        uint64_t sequence;
+        uint32_t message_size;
+        uint8_t hop_in;
+        uint8_t hop_out;
+        uint64_t entry_realtime_ns;
+        uint64_t exit_realtime_ns;
+        uint64_t entry_mono_ns;
+        uint64_t exit_mono_ns;
+    };
+
     QualcommTraceWriter(const AppConfig& config, std::string role)
         : enabled_(config.qualcomm_method),
           role_(std::move(role)),
@@ -625,8 +637,13 @@ class QualcommTraceWriter {
         if (!output_) {
             throw std::runtime_error("failed to open trace file: " + config.trace_file);
         }
+        records_.reserve(static_cast<size_t>(config.message_count * 2));
         output_ << "event,role,protocol,sequence,message_size,hop_in,hop_out,"
                 << "app_entry_realtime_ns,app_exit_realtime_ns,app_entry_mono_ns,app_exit_mono_ns\n";
+    }
+
+    ~QualcommTraceWriter() {
+        Flush();
     }
 
     void Log(
@@ -643,26 +660,48 @@ class QualcommTraceWriter {
             return;
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        output_ << event << ','
-                << role_ << ','
-                << protocol_ << ','
-                << sequence << ','
-                << message_size << ','
-                << static_cast<uint32_t>(hop_in) << ','
-                << static_cast<uint32_t>(hop_out) << ','
-                << entry_realtime_ns << ','
-                << exit_realtime_ns << ','
-                << entry_mono_ns << ','
-                << exit_mono_ns << '\n';
-        output_.flush();
+        records_.push_back(Record{
+            event,
+            sequence,
+            message_size,
+            hop_in,
+            hop_out,
+            entry_realtime_ns,
+            exit_realtime_ns,
+            entry_mono_ns,
+            exit_mono_ns,
+        });
     }
 
   private:
+    void Flush() {
+        if (!enabled_) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& record : records_) {
+            output_ << record.event << ','
+                    << role_ << ','
+                    << protocol_ << ','
+                    << record.sequence << ','
+                    << record.message_size << ','
+                    << static_cast<uint32_t>(record.hop_in) << ','
+                    << static_cast<uint32_t>(record.hop_out) << ','
+                    << record.entry_realtime_ns << ','
+                    << record.exit_realtime_ns << ','
+                    << record.entry_mono_ns << ','
+                    << record.exit_mono_ns << '\n';
+        }
+        records_.clear();
+        output_.flush();
+    }
+
     bool enabled_{false};
     std::string role_;
     std::string protocol_;
     std::mutex mutex_;
     std::ofstream output_;
+    std::vector<Record> records_;
 };
 
 #ifdef HAVE_MSQUIC
@@ -1232,8 +1271,19 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
         std::vector<uint8_t> data;
     };
 
-    SctpConnection(int fd, uint32_t id, uint16_t default_stream_id, ITransportEventHandler& handler, SSL* ssl)
-        : fd_(fd), id_(id), default_stream_id_(default_stream_id), handler_(handler), ssl_(ssl) {
+    SctpConnection(
+        int fd,
+        uint32_t id,
+        uint16_t default_stream_id,
+        ITransportEventHandler& handler,
+        SSL* ssl,
+        bool direct_send)
+        : fd_(fd),
+          id_(id),
+          default_stream_id_(default_stream_id),
+          handler_(handler),
+          direct_send_(direct_send && ssl == nullptr),
+          ssl_(ssl) {
         timeval timeout{};
         timeout.tv_sec = 0;
         timeout.tv_usec = 200000;
@@ -1261,7 +1311,7 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
     }
 
     void StartReceiveLoop() {
-        if (ssl_ == nullptr) {
+        if (ssl_ == nullptr && !direct_send_) {
             send_thread_ = std::thread([self = shared_from_this()]() { self->SendLoop(); });
         }
         recv_thread_ = std::thread([self = shared_from_this()]() { self->ReceiveLoop(); });
@@ -1382,6 +1432,12 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
             return;
         }
 
+        if (direct_send_) {
+            std::lock_guard<std::mutex> lock(direct_send_mutex_);
+            SendBlocking(data, length, stream_id);
+            return;
+        }
+
         {
             std::lock_guard<std::mutex> lock(send_mutex_);
             pending_sends_.push_back(PendingSend{stream_id, std::vector<uint8_t>(data, data + length)});
@@ -1402,6 +1458,12 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
             SSL_shutdown(ssl_);
         }
         if (ssl_ == nullptr) {
+            if (direct_send_) {
+                if (::shutdown(fd_, SHUT_WR) != 0 && errno != ENOTCONN && errno != EBADF) {
+                    throw std::runtime_error(SocketErrorString("shutdown(SHUT_WR)"));
+                }
+                return;
+            }
             send_close_requested_.store(true, std::memory_order_relaxed);
             send_cv_.notify_one();
             return;
@@ -1651,10 +1713,12 @@ class SctpConnection : public ITransportConnection, public std::enable_shared_fr
     const uint32_t id_;
     const uint16_t default_stream_id_;
     ITransportEventHandler& handler_;
+    const bool direct_send_{false};
     std::atomic<bool> closed_{false};
     std::atomic<bool> send_closed_{false};
     std::thread recv_thread_;
     std::thread send_thread_;
+    std::mutex direct_send_mutex_;
     std::mutex send_mutex_;
     std::condition_variable send_cv_;
     std::deque<PendingSend> pending_sends_;
@@ -2552,7 +2616,8 @@ class SctpServerTransport : public ITransportRunner {
                     next_connection_id_.fetch_add(1, std::memory_order_relaxed),
                     config_.sctp_stream_id,
                     handler_,
-                    ssl);
+                    ssl,
+                    config_.qualcomm_method);
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     connections_[connection->Id()] = connection;
@@ -2686,7 +2751,13 @@ class SctpClientTransport : public ITransportRunner {
             }
 
             SSL* ssl = tls_.CreateAndHandshake(fd);
-            auto connection = std::make_shared<SctpConnection>(fd, i, config_.sctp_stream_id, handler_, ssl);
+            auto connection = std::make_shared<SctpConnection>(
+                fd,
+                i,
+                config_.sctp_stream_id,
+                handler_,
+                ssl,
+                config_.qualcomm_method);
             connections_[connection->Id()] = connection;
             handler_.OnConnected(connection);
             if (!connection->UsesExternalPolling()) {
