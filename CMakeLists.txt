@@ -17,6 +17,9 @@ find_package(ZLIB REQUIRED)
 
 add_executable(msquic-loadtest
     src/main.cpp
+    src/sctp_backend.cpp
+    src/msquic_backend.cpp
+    src/lsquic_backend.cpp
 )
 
 target_link_libraries(msquic-loadtest
